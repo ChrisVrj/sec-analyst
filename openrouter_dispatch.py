@@ -32,12 +32,32 @@ from pathlib import Path
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK", "")
 
-# Free models on OpenRouter. Swap if one is down or slow.
-# llama-3.1-8b-instruct:free is the recommended default.
+# Primary model — override via GitHub variable OPENROUTER_MODEL.
+# Falls back through FALLBACK_MODELS if the primary returns HTTP 404
+# (model removed / no endpoints). Add/remove entries freely.
 MODEL = os.environ.get(
     "OPENROUTER_MODEL",
-    "meta-llama/llama-3.1-8b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
 )
+
+FALLBACK_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-3-27b-it:free",
+    "qwen/qwen3-coder-480b-a35b:free",
+    "nvidia/nemotron-3-super-49b:free",
+    "openai/gpt-oss-120b:free",
+    "openai/gpt-oss-20b:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+]
+
+# Build the final ordered list: primary first, then fallbacks (no duplicates)
+_seen: set[str] = set()
+MODEL_LIST: list[str] = []
+for _m in [MODEL] + FALLBACK_MODELS:
+    if _m not in _seen:
+        MODEL_LIST.append(_m)
+        _seen.add(_m)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -225,16 +245,18 @@ def build_user_message(filing: dict) -> str:
     )
 
 
-def call_openrouter(filing: dict) -> str:
+def call_openrouter_model(filing: dict, model: str) -> str:
     """
-    Call OpenRouter with the filing payload.
-    Returns the model's text response, or raises on unrecoverable error.
+    Call OpenRouter with a specific model.
+    Returns the model's text response.
+    Raises RuntimeError on unrecoverable error.
+    Raises ModelUnavailableError (subclass) on HTTP 404 so the caller can try the next model.
     """
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
 
     body = json.dumps({
-        "model":      MODEL,
+        "model":      model,
         "max_tokens": MAX_TOKENS,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -274,21 +296,55 @@ def call_openrouter(filing: dict) -> str:
         except urllib.error.HTTPError as e:
             body_snippet = e.read(300).decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {e.code}: {body_snippet}")
+            if e.code == 404:
+                # Model not available — signal caller to try next fallback
+                raise _ModelUnavailableError(f"Model unavailable ({model}): {body_snippet}")
             if e.code in (429, 500, 502, 503, 504):
-                # Transient — retry
-                log.warning(f"OpenRouter HTTP {e.code} (attempt {attempt}), retrying in {RETRY_DELAY}s...")
+                log.warning(f"OpenRouter HTTP {e.code} on {model} (attempt {attempt}), retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
                 continue
-            raise last_error  # 4xx that won't recover
+            raise last_error  # other 4xx — won't recover
+
+        except _ModelUnavailableError:
+            raise  # propagate immediately so fallback logic kicks in
 
         except Exception as e:
             last_error = e
             if attempt <= MAX_RETRIES:
-                log.warning(f"OpenRouter error (attempt {attempt}): {e}, retrying in {RETRY_DELAY}s...")
+                log.warning(f"OpenRouter error on {model} (attempt {attempt}): {e}, retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
             continue
 
-    raise last_error or RuntimeError("OpenRouter call failed after retries")
+    raise last_error or RuntimeError(f"OpenRouter call failed after retries (model: {model})")
+
+
+class _ModelUnavailableError(RuntimeError):
+    """Raised when a model returns 404 — triggers fallback to next model."""
+
+
+def call_openrouter(filing: dict) -> str:
+    """
+    Try each model in MODEL_LIST in order.
+    Moves to the next model on 404 (model gone / no endpoints).
+    Raises RuntimeError only if every model fails.
+    """
+    last_error: Exception | None = None
+
+    for model in MODEL_LIST:
+        try:
+            result = call_openrouter_model(filing, model)
+            if model != MODEL_LIST[0]:
+                log.info(f"Fallback succeeded with model: {model}")
+            return result
+        except _ModelUnavailableError as e:
+            log.warning(f"Model unavailable, trying next fallback. ({e})")
+            last_error = e
+            continue
+        except Exception as e:
+            # Non-404 failure — don't try other models, surface the error
+            raise
+
+    raise last_error or RuntimeError("All models in fallback list exhausted")
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +436,7 @@ def main() -> None:
         log.info("No filings in inbox — nothing to dispatch.")
         return
 
-    log.info(f"Found {len(pending)} filing(s) to dispatch. Model: {MODEL}")
+    log.info(f"Found {len(pending)} filing(s) to dispatch. Primary model: {MODEL_LIST[0]} ({len(MODEL_LIST)} fallbacks configured)")
     changed = False
 
     for fp in pending:
