@@ -1,0 +1,100 @@
+name: EDGAR SEC Poller
+
+on:
+  # Poll every 30 minutes, Mon–Fri, 6am–10pm ET (= 11:00–03:00 UTC next day)
+  # GitHub cron is UTC. EDGAR hours are 6am-10pm ET = UTC-4 in summer, UTC-5 in winter.
+  # This schedule covers 10:00 UTC – 02:30 UTC (next day), Mon–Fri.
+  # The poller script also checks edgar_is_open() itself as a second guard.
+  schedule:
+    - cron: '*/30 10-23 * * 1-5'   # Mon–Fri, 10:00–23:30 UTC (covers 6am–7:30pm ET)
+    - cron: '*/30 0-2  * * 2-6'    # Tue–Sat, 00:00–02:30 UTC (covers 8pm–10:30pm ET previous day)
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  poll-and-dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60    # Safety ceiling: 3000 filings/month = ~100/day, 4s each ≈ 7 min/run
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout repo
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Set up Python
+      # -----------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # -----------------------------------------------------------------------
+      # 3. Restore seen_accessions cache
+      #    Key includes run_id so each run saves a fresh entry.
+      #    restore-keys grabs the most recent previous run's cache if no exact match.
+      # -----------------------------------------------------------------------
+      - name: Restore seen accessions cache
+        uses: actions/cache@v4
+        with:
+          path: seen_accessions.json
+          key: seen-accessions-${{ github.run_id }}
+          restore-keys: |
+            seen-accessions-
+
+      # -----------------------------------------------------------------------
+      # 4. Restore dispatched accessions cache
+      # -----------------------------------------------------------------------
+      - name: Restore dispatched accessions cache
+        uses: actions/cache@v4
+        with:
+          path: dispatched_accessions.json
+          key: dispatched-accessions-${{ github.run_id }}
+          restore-keys: |
+            dispatched-accessions-
+
+      # -----------------------------------------------------------------------
+      # 5. Run EDGAR poller (--once mode: poll once, write inbox files, exit)
+      # -----------------------------------------------------------------------
+      - name: Run EDGAR poller
+        run: python edgar_poller.py --once
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      # -----------------------------------------------------------------------
+      # 6. Check how many filings are in the inbox
+      # -----------------------------------------------------------------------
+      - name: Count inbox filings
+        id: inbox_count
+        run: |
+          COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Inbox count: $COUNT"
+
+      # -----------------------------------------------------------------------
+      # 7. Run dispatcher (only if there are filings to process)
+      # -----------------------------------------------------------------------
+      - name: Run OpenRouter dispatcher
+        if: steps.inbox_count.outputs.count != '0'
+        run: python openrouter_dispatch.py
+        env:
+          GITHUB_WORKSPACE:    ${{ github.workspace }}
+          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+          DISCORD_WEBHOOK:     ${{ secrets.DISCORD_WEBHOOK }}
+          OPENROUTER_MODEL:    ${{ vars.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free' }}
+
+      # -----------------------------------------------------------------------
+      # 8. Upload logs as artifact (visible in Actions UI for 7 days)
+      # -----------------------------------------------------------------------
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: |
+            edgar_poller.log
+            dispatch.log
+          retention-days: 7
