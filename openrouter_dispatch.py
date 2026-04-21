@@ -44,8 +44,8 @@ FALLBACK_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-3-27b-it:free",
-    "qwen/qwen3-coder-480b-a35b:free",
-    "nvidia/nemotron-3-super-49b:free",
+    "qwen/qwen3-coder-480b-a35b-instruct:free",
+    "nvidia/llama-3.1-nemotron-nano-8b-v1:free",
     "openai/gpt-oss-120b:free",
     "openai/gpt-oss-20b:free",
     "meta-llama/llama-3.2-3b-instruct:free",
@@ -299,7 +299,8 @@ def call_openrouter_model(filing: dict, model: str) -> str:
         except urllib.error.HTTPError as e:
             body_snippet = e.read(300).decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {e.code}: {body_snippet}")
-            if e.code == 404:
+            if e.code in (404, 400):
+                # 404 = no endpoints; 400 = invalid model ID — both mean try next model
                 raise _ModelUnavailableError(f"Model unavailable ({model}): {body_snippet}")
             if e.code in (429, 500, 502, 503, 504):
                 log.warning(f"OpenRouter HTTP {e.code} on {model} (attempt {attempt}), retrying in {RETRY_DELAY}s...")
