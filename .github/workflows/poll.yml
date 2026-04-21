@@ -1,42 +1,50 @@
 name: EDGAR SEC Poller
 
-on:
-  # Poll every 30 minutes, Mon–Fri, 6am–10pm ET (= 11:00–03:00 UTC next day)
-  # GitHub cron is UTC. EDGAR hours are 6am-10pm ET = UTC-4 in summer, UTC-5 in winter.
-  # This schedule covers 10:00 UTC – 02:30 UTC (next day), Mon–Fri.
-  # The poller script also checks edgar_is_open() itself as a second guard.
-  schedule:
-    - cron: '*/30 10-23 * * 1-5'   # Mon–Fri, 10:00–23:30 UTC (covers 6am–7:30pm ET)
-    - cron: '*/30 0-2  * * 2-6'    # Tue–Sat, 00:00–02:30 UTC (covers 8pm–10:30pm ET previous day)
+# ─────────────────────────────────────────────────────────────────────────────
+# Schedule — Sofia, Bulgaria (EEST = UTC+3 in summer, EET = UTC+2 in winter)
+#
+# Window 1 : 10:30 AM – 06:00 PM Sofia  →  07:30–15:00 UTC  (summer)
+# Window 2 : 10:50 PM – 04:00 AM Sofia  →  19:50–01:00 UTC  (summer)
+#
+# ⚠ When clocks go back to EET (UTC+2, late Oct – late Mar), add 1 hour to
+#   all UTC times below (e.g. 07:30 → 08:30, 19:50 → 20:50, 01:00 → 02:00).
+#
+# Each triggered job polls EDGAR every 30 s for ~4 min (≈8 polls/job).
+# Minimum GitHub Actions cron resolution is 5 min → ~1 min gap between jobs.
+# ─────────────────────────────────────────────────────────────────────────────
 
-  # Allow manual trigger for testing
-  workflow_dispatch:
+on:
+  schedule:
+    # ── Window 1 : 10:30 AM – 06:00 PM Sofia (07:30–15:00 UTC), Mon–Fri ─────
+    - cron: '30/5 7 * * 1-5'     # 07:30, 07:35 … 07:55
+    - cron: '*/5 8-14 * * 1-5'   # 08:00 … 14:55
+    - cron: '0 15 * * 1-5'       # 15:00  (= 18:00 Sofia)
+
+    # ── Window 2 : 10:50 PM – 04:00 AM Sofia (19:50 UTC – 01:00 UTC), Mon–Sat
+    - cron: '50/5 19 * * 1-5'    # 19:50, 19:55
+    - cron: '*/5 20-23 * * 1-5'  # 20:00 … 23:55
+    - cron: '*/5 0 * * 2-6'      # 00:00 … 00:55
+    - cron: '0 1 * * 2-6'        # 01:00  (= 04:00 Sofia)
+
+  workflow_dispatch:  # keep manual trigger for testing
 
 jobs:
   poll-and-dispatch:
     runs-on: ubuntu-latest
-    timeout-minutes: 60    # Safety ceiling: 3000 filings/month = ~100/day, 4s each ≈ 7 min/run
+    timeout-minutes: 10
 
     steps:
-      # -----------------------------------------------------------------------
-      # 1. Checkout repo
-      # -----------------------------------------------------------------------
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # 2. Set up Python
-      # -----------------------------------------------------------------------
+      # ── 2. Python ──────────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # -----------------------------------------------------------------------
-      # 3. Restore seen_accessions cache
-      #    Key includes run_id so each run saves a fresh entry.
-      #    restore-keys grabs the most recent previous run's cache if no exact match.
-      # -----------------------------------------------------------------------
+      # ── 3. Restore caches ──────────────────────────────────────────────────
       - name: Restore seen accessions cache
         uses: actions/cache@v4
         with:
@@ -45,9 +53,6 @@ jobs:
           restore-keys: |
             seen-accessions-
 
-      # -----------------------------------------------------------------------
-      # 4. Restore dispatched accessions cache
-      # -----------------------------------------------------------------------
       - name: Restore dispatched accessions cache
         uses: actions/cache@v4
         with:
@@ -56,39 +61,39 @@ jobs:
           restore-keys: |
             dispatched-accessions-
 
-      # -----------------------------------------------------------------------
-      # 5. Run EDGAR poller (--once mode: poll once, write inbox files, exit)
-      # -----------------------------------------------------------------------
-      - name: Run EDGAR poller
-        run: python edgar_poller.py --once
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      # -----------------------------------------------------------------------
-      # 6. Check how many filings are in the inbox
-      # -----------------------------------------------------------------------
-      - name: Count inbox filings
-        id: inbox_count
+      # ── 4. Poll + dispatch loop (runs for ~4 min, polls every 30 s) ────────
+      - name: Poll and dispatch loop
         run: |
-          COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Inbox count: $COUNT"
+          END_TIME=$(( $(date +%s) + 240 ))
+          POLL=0
 
-      # -----------------------------------------------------------------------
-      # 7. Run dispatcher (only if there are filings to process)
-      # -----------------------------------------------------------------------
-      - name: Run OpenRouter dispatcher
-        if: steps.inbox_count.outputs.count != '0'
-        run: python openrouter_dispatch.py
+          while [ $(date +%s) -lt $END_TIME ]; do
+            POLL=$(( POLL + 1 ))
+            echo "──── Poll #$POLL at $(date -u '+%H:%M:%S UTC') ────"
+
+            python edgar_poller.py --once
+
+            COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+            echo "Inbox: $COUNT filing(s)"
+
+            if [ "$COUNT" -gt "0" ]; then
+              python openrouter_dispatch.py
+            fi
+
+            REMAINING=$(( END_TIME - $(date +%s) ))
+            if [ $REMAINING -gt 30 ]; then
+              sleep 30
+            fi
+          done
+
+          echo "Loop complete after $POLL poll(s)."
         env:
-          GITHUB_WORKSPACE:    ${{ github.workspace }}
-          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
-          DISCORD_WEBHOOK:     ${{ secrets.DISCORD_WEBHOOK }}
-          OPENROUTER_MODEL:    ${{ vars.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free' }}
+          GITHUB_WORKSPACE:   ${{ github.workspace }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DISCORD_WEBHOOK:    ${{ secrets.DISCORD_WEBHOOK }}
+          OPENROUTER_MODEL:   ${{ vars.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free' }}
 
-      # -----------------------------------------------------------------------
-      # 8. Upload logs as artifact (visible in Actions UI for 7 days)
-      # -----------------------------------------------------------------------
+      # ── 5. Upload logs ─────────────────────────────────────────────────────
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
