@@ -293,34 +293,28 @@ def call_openrouter_model(filing: dict, model: str) -> str:
 
             return content
 
+        except _ModelUnavailableError:
+            raise  # propagate immediately so fallback logic kicks in
+
         except urllib.error.HTTPError as e:
             body_snippet = e.read(300).decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {e.code}: {body_snippet}")
             if e.code == 404:
-                # Model not available — signal caller to try next fallback
                 raise _ModelUnavailableError(f"Model unavailable ({model}): {body_snippet}")
             if e.code in (429, 500, 502, 503, 504):
                 log.warning(f"OpenRouter HTTP {e.code} on {model} (attempt {attempt}), retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
-                continue
-            raise last_error  # other 4xx — won't recover
-
-        # If we've exhausted all retries on a transient error, treat as unavailable
-        # so the outer loop can try the next fallback model
-        if last_error is not None:
-            raise _ModelUnavailableError(f"Model {model} failed after {MAX_RETRIES + 1} attempts: {last_error}")
-
-        except _ModelUnavailableError:
-            raise  # propagate immediately so fallback logic kicks in
+            else:
+                raise last_error  # other 4xx — won't recover
 
         except Exception as e:
             last_error = e
             if attempt <= MAX_RETRIES:
                 log.warning(f"OpenRouter error on {model} (attempt {attempt}): {e}, retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
-            continue
 
-    raise last_error or RuntimeError(f"OpenRouter call failed after retries (model: {model})")
+    # All retries exhausted — treat as unavailable so outer loop tries next model
+    raise _ModelUnavailableError(f"Model {model} failed after all attempts: {last_error}")
 
 
 class _ModelUnavailableError(RuntimeError):
