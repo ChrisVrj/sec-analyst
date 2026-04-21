@@ -71,8 +71,8 @@ MAX_TOKENS           = 700
 MAX_TEXT_CHARS       = 8_000   # chars of filing_text sent to LLM (keep tokens manageable)
 MAX_DISCORD_CHARS    = 1_900
 SLEEP_BETWEEN_CALLS  = 4       # seconds between OpenRouter calls (stay under 20 req/min)
-MAX_RETRIES          = 2       # retry on transient HTTP errors
-RETRY_DELAY          = 10      # seconds between retries
+MAX_RETRIES          = 1       # retry once on transient errors, then try next model
+RETRY_DELAY          = 3       # seconds between retries
 REQUEST_TIMEOUT      = 90      # seconds to wait for LLM response
 
 # ---------------------------------------------------------------------------
@@ -304,6 +304,11 @@ def call_openrouter_model(filing: dict, model: str) -> str:
                 time.sleep(RETRY_DELAY)
                 continue
             raise last_error  # other 4xx — won't recover
+
+        # If we've exhausted all retries on a transient error, treat as unavailable
+        # so the outer loop can try the next fallback model
+        if last_error is not None:
+            raise _ModelUnavailableError(f"Model {model} failed after {MAX_RETRIES + 1} attempts: {last_error}")
 
         except _ModelUnavailableError:
             raise  # propagate immediately so fallback logic kicks in
