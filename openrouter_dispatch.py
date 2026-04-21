@@ -44,8 +44,6 @@ FALLBACK_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-3-27b-it:free",
-    "qwen/qwen3-coder-480b-a35b-instruct:free",
-    "nvidia/llama-3.1-nemotron-nano-8b-v1:free",
     "openai/gpt-oss-120b:free",
     "openai/gpt-oss-20b:free",
     "meta-llama/llama-3.2-3b-instruct:free",
