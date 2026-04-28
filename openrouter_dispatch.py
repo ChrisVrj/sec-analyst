@@ -199,7 +199,10 @@ def post_discord(content: str) -> None:
     req = urllib.request.Request(
         DISCORD_WEBHOOK,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/ChrisVrj/sec-analyst, 1.0)",
+        },
         method="POST",
     )
     try:
