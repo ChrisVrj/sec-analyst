@@ -43,7 +43,6 @@ MODEL = os.environ.get(
 FALLBACK_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-4-31b-it:free",
-    "google/gemma-3-27b-it:free",
     "openai/gpt-oss-120b:free",
     "openai/gpt-oss-20b:free",
     "meta-llama/llama-3.2-3b-instruct:free",

@@ -83,6 +83,10 @@ jobs:
             REMAINING=$(( END_TIME - $(date +%s) ))
             if [ $REMAINING -gt 30 ]; then
               sleep 30
+            elif [ $REMAINING -gt 5 ]; then
+              sleep 5
+            else
+              break
             fi
           done
 
