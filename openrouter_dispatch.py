@@ -30,7 +30,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK") or "https://discord.com/api/webhooks/1496165791714906122/lrYOIpgKhd2NdzE8as1usDXaW8q1GEy90bX2R0eNRblGJDv6XvoFistqEwQ3VZsHD3ph"
+DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
 # Primary model — override via GitHub variable OPENROUTER_MODEL.
 # Falls back through FALLBACK_MODELS if the primary returns HTTP 404
@@ -167,6 +167,8 @@ log = logging.getLogger(__name__)
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED.mkdir(parents=True, exist_ok=True)
 
+log.info(f"DISCORD_WEBHOOK len={len(DISCORD_WEBHOOK)} prefix={DISCORD_WEBHOOK[:50]!r}")
+
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -200,9 +202,13 @@ def post_discord(content: str) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        if resp.status not in (200, 204):
-            raise RuntimeError(f"Discord returned HTTP {resp.status}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status not in (200, 204):
+                raise RuntimeError(f"Discord returned HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        body = e.read(300).decode("utf-8", errors="replace")
+        raise RuntimeError(f"Discord HTTP {e.code}: {body}")
 
 
 def send_discord(content: str, label: str = "") -> None:
