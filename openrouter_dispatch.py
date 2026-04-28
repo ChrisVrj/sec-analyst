@@ -30,7 +30,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK", "")
+DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK") or "https://discord.com/api/webhooks/1496165791714906122/lrYOIpgKhd2NdzE8as1usDXaW8q1GEy90bX2R0eNRblGJDv6XvoFistqEwQ3VZsHD3ph"
 
 # Primary model — override via GitHub variable OPENROUTER_MODEL.
 # Falls back through FALLBACK_MODELS if the primary returns HTTP 404
