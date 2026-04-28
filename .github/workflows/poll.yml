@@ -61,7 +61,20 @@ jobs:
           restore-keys: |
             dispatched-accessions-
 
-      # ── 4. Poll + dispatch loop (runs for ~4 min, polls every 30 s) ────────
+      # ── 4. Test Discord webhook directly with curl ────────────────────────
+      - name: Test Discord webhook
+        run: |
+          echo "Testing Discord webhook with curl..."
+          HTTP=$(curl -s -o /tmp/discord_resp.txt -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"test from github actions"}' \
+            "$DISCORD_WEBHOOK")
+          echo "HTTP status: $HTTP"
+          echo "Response body: $(cat /tmp/discord_resp.txt)"
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+      # ── 5. Poll + dispatch loop (runs for ~4 min, polls every 30 s) ────────
       - name: Poll and dispatch loop
         run: |
           END_TIME=$(( $(date +%s) + 240 ))
