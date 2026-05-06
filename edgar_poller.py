@@ -204,7 +204,7 @@ def fetch_recent_filings() -> list[dict]:
 # Filing text extraction
 # ---------------------------------------------------------------------------
 
-def strip_html(html: str) -> str:
+def strip_html(html: str, max_chars: int = 300_000) -> str:
     text = re.sub(r"<script.*?>.*?</script>", " ", html, flags=re.I | re.S)
     text = re.sub(r"<style.*?>.*?</style>",   " ", text, flags=re.I | re.S)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -214,27 +214,92 @@ def strip_html(html: str) -> str:
             .replace("&lt;",   "<")
             .replace("&gt;",   ">"))
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:80_000]
+    return text[:max_chars]
 
 
-def extract_document_url(index_html: str, index_url: str) -> str:
-    candidates = re.findall(r'href="([^"]+)"', index_html, flags=re.I)
+def _is_valid_doc_href(href: str) -> bool:
+    """Return True if this href points to a real filing document (not SEC nav)."""
+    lower = href.lower()
+    if "-index.htm" in lower:
+        return False
+    if not lower.endswith((".htm", ".html", ".txt")):
+        return False
+    # Skip XBRL/graphic files
+    if re.search(r'\.(xsd|xml|jpg|png|gif|css|js|cal|lab|pre|def)$', lower):
+        return False
+    # Skip SEC website navigation — only allow relative paths or /Archives/ absolute paths
+    if lower.startswith("/") and "/archives/edgar/data/" not in lower:
+        return False
+    if lower.startswith("http") and "/archives/edgar/data/" not in lower:
+        return False
+    return True
 
-    for href in candidates:
-        href = href.strip()
 
+def extract_document_urls(index_html: str, index_url: str) -> list[str]:
+    """
+    Parse the EDGAR filing index page and return document URLs in priority order:
+    1. Primary document (Seq 1 in the filing table)
+    2. EX-99.x exhibits (press releases, supplements — the actual content for 8-Ks)
+    Falls back to first valid href if table parsing fails.
+    """
+    primary_url = ""
+    exhibit_urls: list[str] = []
+
+    # Parse the EDGAR document table rows
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', index_html, flags=re.I | re.S)
+    for row in rows:
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, flags=re.I | re.S)
+        if len(cells) < 3:
+            continue
+
+        href_match = re.search(r'href="([^"]+)"', row, flags=re.I)
+        if not href_match:
+            continue
+
+        href = href_match.group(1).strip()
         if "/ix?doc=" in href:
             href = href.split("/ix?doc=", 1)[1]
 
-        lower = href.lower()
-        if "-index.htm" in lower:
-            continue
-        if not lower.endswith((".htm", ".html", ".txt")):
+        if not _is_valid_doc_href(href):
             continue
 
-        return urllib.parse.urljoin(index_url, href)
+        full_url = urllib.parse.urljoin(index_url, href)
+        row_text = re.sub(r'<[^>]+>', ' ', row)
 
-    return ""
+        # Seq 1 = primary document
+        seq_text = re.sub(r'<[^>]+>', '', cells[0]).strip()
+        if seq_text == "1" and not primary_url:
+            primary_url = full_url
+        # EX-99.x = press releases / exhibits with real content
+        elif re.search(r'EX-99', row_text, re.I):
+            exhibit_urls.append(full_url)
+
+    # Fallback: first valid href in the whole page
+    if not primary_url:
+        for href in re.findall(r'href="([^"]+)"', index_html, flags=re.I):
+            href = href.strip()
+            if "/ix?doc=" in href:
+                href = href.split("/ix?doc=", 1)[1]
+            if _is_valid_doc_href(href):
+                primary_url = urllib.parse.urljoin(index_url, href)
+                break
+
+    result = []
+    if primary_url:
+        result.append(primary_url)
+    result.extend(exhibit_urls[:2])  # up to 2 exhibits (EX-99.1, EX-99.2)
+    return result
+
+
+def _fetch_url_text(url: str, timeout: int = 30) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return strip_html(raw)
+    except Exception as e:
+        log.warning(f"Could not fetch {url}: {e}")
+        return ""
 
 
 def fetch_filing_text(accession_raw: str, cik: str) -> str:
@@ -253,19 +318,20 @@ def fetch_filing_text(accession_raw: str, cik: str) -> str:
         log.warning(f"Could not fetch index for {accession_raw}: {e}")
         return ""
 
-    doc_url = extract_document_url(index_html, index_url)
-    if not doc_url:
-        log.warning(f"No primary document URL found for {accession_raw}")
+    doc_urls = extract_document_urls(index_html, index_url)
+    if not doc_urls:
+        log.warning(f"No document URLs found for {accession_raw}")
         return ""
 
-    doc_req = urllib.request.Request(doc_url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(doc_req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return strip_html(raw)
-    except Exception as e:
-        log.warning(f"Could not fetch filing body for {accession_raw}: {e}")
-        return ""
+    parts = []
+    for i, url in enumerate(doc_urls):
+        text = _fetch_url_text(url)
+        if text:
+            parts.append(text)
+        if i < len(doc_urls) - 1:
+            time.sleep(0.3)  # respect SEC rate limits between doc fetches
+
+    return "\n\n---\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
