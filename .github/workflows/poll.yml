@@ -1,34 +1,32 @@
 name: EDGAR SEC Poller
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schedule — Sofia, Bulgaria
+# WHY */5 * * * * instead of targeted crons?
 #
-#   Summer  EEST = UTC+3  (last Sun Mar → last Sun Oct)
-#   Winter  EET  = UTC+2  (last Sun Oct → last Sun Mar)
+# GitHub throttles scheduled workflows on low-activity repos, causing runs to
+# fire every 1-2 hours instead of every 5 minutes. A single high-frequency
+# cron keeps the workflow "hot" so GitHub honours the cadence reliably.
 #
-# Target windows (Sofia local time):
-#   Window 1 : 11:00 AM – 04:30 PM  →  08:00–13:30 UTC (EEST)  /  09:00–14:30 UTC (EET)
-#   Window 2 : 11:00 PM – 01:30 AM  →  20:00–22:30 UTC (EEST)  /  21:00–23:30 UTC (EET)
+# The time-window check is done in bash (step 1). All subsequent steps carry
+# an  if: steps.window.outputs.proceed == 'true'  guard so they are skipped
+# instantly when the job fires outside the Sofia trading windows.
 #
-# ⚠ When clocks go back to EET (late Oct), update the UTC hours below by +1.
-#   e.g. Window 1 becomes "*/5 9-13 * * 1-5" + "0,5,10,15,20,25,30 14 * * 1-5"
-#        Window 2 becomes "*/5 21 * * 1-5"   + "0,5,10,15,20,25,30 23 * * 1-5"
+# Trading windows (Sofia local time):
+#   Window 1 : 11:00 AM – 04:30 PM
+#   Window 2 : 11:00 PM – 01:30 AM (next day)
 #
-# Each triggered job polls EDGAR every 30 s for ~4 min (≈8 polls/job).
-# Minimum GitHub Actions cron resolution is 5 min → one job per 5-min slot.
+# UTC equivalents (EEST = UTC+3, summer):
+#   Window 1 : 08:00 – 13:30 UTC  →  480 – 810  min
+#   Window 2 : 20:00 – 22:30 UTC  → 1200 – 1350 min
+#
+# ⚠ When clocks go back to EET (UTC+2, late Oct – late Mar):
+#   Set W1_START=540 W1_END=870 W2_START=1260 W2_END=1410
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    # ── Window 1 : 11:00 AM – 04:30 PM Sofia  (08:00–13:30 UTC, EEST) ───────
-    - cron: '*/5 8-12 * * 1-5'               # 08:00 … 12:55
-    - cron: '0,5,10,15,20,25,30 13 * * 1-5'  # 13:00 … 13:30
-
-    # ── Window 2 : 11:00 PM – 01:30 AM Sofia  (20:00–22:30 UTC, EEST) ───────
-    - cron: '*/5 20-21 * * 1-5'               # 20:00 … 21:55
-    - cron: '0,5,10,15,20,25,30 22 * * 1-5'  # 22:00 … 22:30
-
-  workflow_dispatch:  # keep manual trigger for testing
+    - cron: '*/5 * * * *'   # every 5 min 24/7 — window check below keeps it clean
+  workflow_dispatch:         # manual trigger for testing
 
 jobs:
   poll-and-dispatch:
@@ -36,18 +34,56 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # ── 1. Check trading window ────────────────────────────────────────────
+      - name: Check trading window
+        id: window
+        run: |
+          HOUR_UTC=$(date -u +%-H)
+          MIN_UTC=$(date -u  +%-M)
+          TIME_UTC=$(( HOUR_UTC * 60 + MIN_UTC ))
+          DOW=$(date -u +%u)   # 1=Mon … 7=Sun
+
+          echo "UTC $(date -u '+%H:%M')  DOW=$DOW  min=$TIME_UTC"
+
+          PROCEED=false
+
+          if [ "$DOW" -lt 6 ]; then
+            # ── EEST (UTC+3) ──────────────────────────────────────────────
+            W1_START=480    # 08:00 UTC = 11:00 Sofia
+            W1_END=810      # 13:30 UTC = 16:30 Sofia
+            W2_START=1200   # 20:00 UTC = 23:00 Sofia
+            W2_END=1350     # 22:30 UTC = 01:30 Sofia (+1)
+
+            if   [ "$TIME_UTC" -ge "$W1_START" ] && [ "$TIME_UTC" -lt "$W1_END" ]; then
+              echo "Window 1 — proceeding."
+              PROCEED=true
+            elif [ "$TIME_UTC" -ge "$W2_START" ] && [ "$TIME_UTC" -lt "$W2_END" ]; then
+              echo "Window 2 — proceeding."
+              PROCEED=true
+            else
+              echo "Outside windows — skipping."
+            fi
+          else
+            echo "Weekend — skipping."
+          fi
+
+          echo "proceed=$PROCEED" >> "$GITHUB_OUTPUT"
+
+      # ── 2. Checkout ────────────────────────────────────────────────────────
       - name: Checkout
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/checkout@v4
 
-      # ── 2. Python ──────────────────────────────────────────────────────────
+      # ── 3. Python ──────────────────────────────────────────────────────────
       - name: Set up Python
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ── 3. Restore caches ──────────────────────────────────────────────────
+      # ── 4. Restore caches ──────────────────────────────────────────────────
       - name: Restore seen accessions cache
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/cache@v4
         with:
           path: seen_accessions.json
@@ -56,6 +92,7 @@ jobs:
             seen-accessions-
 
       - name: Restore dispatched accessions cache
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/cache@v4
         with:
           path: dispatched_accessions.json
@@ -63,8 +100,9 @@ jobs:
           restore-keys: |
             dispatched-accessions-
 
-      # ── 4. Poll + dispatch loop (runs for ~4 min, polls every 30 s) ────────
+      # ── 5. Poll + dispatch loop (runs for ~4 min, polls every 30 s) ────────
       - name: Poll and dispatch loop
+        if: steps.window.outputs.proceed == 'true'
         run: |
           END_TIME=$(( $(date +%s) + 240 ))
           POLL=0
@@ -99,9 +137,9 @@ jobs:
           DISCORD_WEBHOOK:    ${{ secrets.DISCORD_WEBHOOK }}
           OPENROUTER_MODEL:   ${{ vars.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free' }}
 
-      # ── 5. Upload logs (always, even on failure) ──────────────────────────
+      # ── 6. Upload logs (always, even on failure) ───────────────────────────
       - name: Upload logs
-        if: always()
+        if: steps.window.outputs.proceed == 'true' && always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ github.run_id }}
