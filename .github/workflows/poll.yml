@@ -1,30 +1,32 @@
 name: EDGAR SEC Poller
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schedule — Sofia, Bulgaria (EEST = UTC+3 in summer, EET = UTC+2 in winter)
+# Schedule — Sofia, Bulgaria
 #
-# Window 1 : 10:30 AM – 06:00 PM Sofia  →  07:30–15:00 UTC  (summer)
-# Window 2 : 10:50 PM – 04:00 AM Sofia  →  19:50–01:00 UTC  (summer)
+#   Summer  EEST = UTC+3  (last Sun Mar → last Sun Oct)
+#   Winter  EET  = UTC+2  (last Sun Oct → last Sun Mar)
 #
-# ⚠ When clocks go back to EET (UTC+2, late Oct – late Mar), add 1 hour to
-#   all UTC times below (e.g. 07:30 → 08:30, 19:50 → 20:50, 01:00 → 02:00).
+# Target windows (Sofia local time):
+#   Window 1 : 11:00 AM – 04:30 PM  →  08:00–13:30 UTC (EEST)  /  09:00–14:30 UTC (EET)
+#   Window 2 : 11:00 PM – 01:30 AM  →  20:00–22:30 UTC (EEST)  /  21:00–23:30 UTC (EET)
+#
+# ⚠ When clocks go back to EET (late Oct), update the UTC hours below by +1.
+#   e.g. Window 1 becomes "*/5 9-13 * * 1-5" + "0,5,10,15,20,25,30 14 * * 1-5"
+#        Window 2 becomes "*/5 21 * * 1-5"   + "0,5,10,15,20,25,30 23 * * 1-5"
 #
 # Each triggered job polls EDGAR every 30 s for ~4 min (≈8 polls/job).
-# Minimum GitHub Actions cron resolution is 5 min → ~1 min gap between jobs.
+# Minimum GitHub Actions cron resolution is 5 min → one job per 5-min slot.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    # ── Window 1 : 10:30 AM – 06:00 PM Sofia (07:30–15:00 UTC), Mon–Fri ─────
-    - cron: '30/5 7 * * 1-5'     # 07:30, 07:35 … 07:55
-    - cron: '*/5 8-14 * * 1-5'   # 08:00 … 14:55
-    - cron: '0 15 * * 1-5'       # 15:00  (= 18:00 Sofia)
+    # ── Window 1 : 11:00 AM – 04:30 PM Sofia  (08:00–13:30 UTC, EEST) ───────
+    - cron: '*/5 8-12 * * 1-5'               # 08:00 … 12:55
+    - cron: '0,5,10,15,20,25,30 13 * * 1-5'  # 13:00 … 13:30
 
-    # ── Window 2 : 10:50 PM – 04:00 AM Sofia (19:50 UTC – 01:00 UTC), Mon–Sat
-    - cron: '50/5 19 * * 1-5'    # 19:50, 19:55
-    - cron: '*/5 20-23 * * 1-5'  # 20:00 … 23:55
-    - cron: '*/5 0 * * 2-6'      # 00:00 … 00:55
-    - cron: '0 1 * * 2-6'        # 01:00  (= 04:00 Sofia)
+    # ── Window 2 : 11:00 PM – 01:30 AM Sofia  (20:00–22:30 UTC, EEST) ───────
+    - cron: '*/5 20-21 * * 1-5'               # 20:00 … 21:55
+    - cron: '0,5,10,15,20,25,30 22 * * 1-5'  # 22:00 … 22:30
 
   workflow_dispatch:  # keep manual trigger for testing
 
