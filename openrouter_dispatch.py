@@ -2,18 +2,20 @@
 """
 OpenRouter dispatcher for the OpenClaw sec-analyst pipeline.
 
-What this does:
-  - Reads all *.json filing payloads from filings-inbox/
-  - For each filing, calls OpenRouter with the sec-analyst prompt
-  - Posts the returned summary to Discord via webhook
-  - Moves processed filings to filings-inbox/processed/
-  - Sends a Discord alert if a call fails or returns no content
-  - Persists dispatched accessions so restarts never duplicate posts
+Pipeline:
+  1. Read all *.json filing payloads from filings-inbox/
+  2. Pre-filter each filing against prefilter.should_skip (drops Form 3/4/5
+     from non-activists and unlisted/structured 424B & FWP offerings)
+  3. For surviving filings, call OpenRouter with the sec-analyst prompt
+  4. Post the structured summary to Discord via webhook
+  5. Move processed filings to filings-inbox/processed/
+  6. Send a Discord alert if a call fails or returns no content
+  7. Persist dispatched accessions so restarts never duplicate posts
 
 Rate limiting:
-  - Most OpenRouter free models: 20 req/min, 200 req/day
-  - SLEEP_BETWEEN_CALLS (default 4s) keeps us at ~15 req/min → safe margin
-  - If you're hitting 200/day, reduce MAX_DAILY_DISPATCHES or upgrade model
+  - OpenRouter free tier ≈ 20 req/min, 200 req/day
+  - SLEEP_BETWEEN_CALLS (default 4s) keeps us at ~15 req/min — safe margin
+  - Pre-filtered (skipped) filings DO NOT count against the rate limit
 """
 
 import json
@@ -25,6 +27,8 @@ import urllib.error
 from datetime import datetime, UTC
 from pathlib import Path
 
+from prefilter import should_skip
+
 # ---------------------------------------------------------------------------
 # Config — all secrets come from environment variables (GitHub Secrets)
 # ---------------------------------------------------------------------------
@@ -32,9 +36,6 @@ from pathlib import Path
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
-# Primary model — override via GitHub variable OPENROUTER_MODEL.
-# Falls back through FALLBACK_MODELS if the primary returns HTTP 404
-# (model removed / no endpoints). Add/remove entries freely.
 MODEL = os.environ.get(
     "OPENROUTER_MODEL",
     "meta-llama/llama-3.3-70b-instruct:free",
@@ -48,7 +49,6 @@ FALLBACK_MODELS = [
     "meta-llama/llama-3.2-3b-instruct:free",
 ]
 
-# Build the final ordered list: primary first, then fallbacks (no duplicates)
 _seen: set[str] = set()
 MODEL_LIST: list[str] = []
 for _m in [MODEL] + FALLBACK_MODELS:
@@ -58,67 +58,143 @@ for _m in [MODEL] + FALLBACK_MODELS:
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-BASE_DIR   = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).parent))
-INBOX_DIR  = BASE_DIR / "filings-inbox"
-PROCESSED  = INBOX_DIR / "processed"
-LOG_FILE   = BASE_DIR / "dispatch.log"
+BASE_DIR        = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).parent))
+INBOX_DIR       = BASE_DIR / "filings-inbox"
+PROCESSED       = INBOX_DIR / "processed"
+LOG_FILE        = BASE_DIR / "dispatch.log"
 DISPATCHED_FILE = BASE_DIR / "dispatched_accessions.json"
 
-MAX_TOKENS           = 800     # enough for a full structured summary under 1800 chars
-MAX_TEXT_CHARS       = 400_000 # send essentially the full filing text
-MAX_DISCORD_CHARS    = 1_900   # Discord hard limit is 2000; each chunk stays under
-SLEEP_BETWEEN_CALLS  = 4       # seconds between OpenRouter calls (stay under 20 req/min)
-MAX_RETRIES          = 1       # retry once on transient errors, then try next model
-RETRY_DELAY          = 3       # seconds between retries
-REQUEST_TIMEOUT      = 90      # seconds to wait for LLM response
+MAX_TOKENS          = 900
+MAX_TEXT_CHARS      = 400_000
+MAX_DISCORD_CHARS   = 1_900
+SLEEP_BETWEEN_CALLS = 4
+MAX_RETRIES         = 1
+RETRY_DELAY         = 3
+REQUEST_TIMEOUT     = 90
 
 # ---------------------------------------------------------------------------
-# System prompt (IDENTITY.md embedded)
+# System prompt — structured Discord output with priority highlight block.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a fixed-income trading analyst. You read SEC filings and write concise, actionable Discord summaries for a professional trader specializing in preferred stocks, baby bonds, exchange-traded debt, CEFs, and BDCs.
+SYSTEM_PROMPT = """You are a fixed-income trading analyst. Your reader is a professional trader of PUBLICLY TRADED preferred stocks, baby bonds, exchange-traded debt, CEFs, and BDCs. You read one SEC filing at a time and write a structured Discord summary.
 
-ALWAYS write a full summary — no one-liner dismissals, no exceptions.
+== PRIORITY ORDER ==
+Lead with the highest-priority event the filing actually discloses. Use it to pick the [EMOJI] for line 1 and to decide which highlight block (if any) to include.
+1. Redemption / call of an existing publicly traded security
+2. New issuance that WILL BE LISTED on NYSE or NASDAQ
+3. M&A or change-of-control affecting publicly traded preferreds / baby bonds
+4. Tender or exchange offer for a publicly traded security
+5. Distribution change on a publicly traded security
+6. CEF / BDC NAV or financial update
+7. Other material event
 
-OUTPUT FORMAT (strict):
-[EMOJI] TICKER | FORM | Date — [one-sentence headline]
-Company: [Name]
-[body: 3-6 lines of plain text, no bullet points]
-Link: [EDGAR URL from the filing payload]
+== OUTPUT TEMPLATE ==
+
+Line 1: [EMOJI] **TICKER | FORM | YYYY-MM-DD** — one-sentence headline (≤120 chars)
+Line 2: Company: <legal name>
+
+[HIGHLIGHT BLOCK — include ONLY if a priority-1 to priority-4 trigger is LITERALLY stated in the filing. If unsure, omit the block. Never fabricate.]
+
+For redemption / call of publicly traded security:
+## 🚨 REDEMPTION OF PUBLICLY TRADED SECURITY
+> "verbatim quote naming the series, redemption price, redemption date, and accrued-dividend treatment"
+
+For new publicly listed issuance (only when listing on NYSE or NASDAQ is stated):
+## 📢 LISTING: PUBLIC — <NYSE | NASDAQ> SYMBOL "<X>"
+> "verbatim quote on listing application or expected listing"
+
+For use of proceeds that names existing publicly traded securities to be redeemed:
+## 💸 PROCEEDS WILL REDEEM EXISTING SECURITIES: <ticker(s)>
+> "verbatim quote from use-of-proceeds section"
+
+For M&A / change-of-control affecting preferreds or baby bonds:
+## ⚠️ M&A — CHANGE OF CONTROL
+> "verbatim quote on change-of-control terms for preferred / baby bond holders"
+
+For tender or exchange offer on a publicly traded security:
+## 🔁 TENDER / EXCHANGE OFFER
+> "verbatim quote naming the security, offer price, expiration"
+
+[BODY — pick ONE section by filing type. Use "n/d" for figures the filing doesn't disclose. Drop lines that don't apply.]
+
+— CEF / BDC NAV (N-CSR, N-CSRS, N-PORT, N-2, 10-Q, 10-K, 8-K with NAV) —
+**NAV:** $X.XX per share (prior $X.XX, ±X.X%)
+**Market price:** $X.XX (X.X% discount / premium)
+**Total net assets:** $X.XXbn (prior $X.XXbn)
+**Total assets:** $X.XXbn
+**Total liabilities:** $X.XXm
+**Shares outstanding:** X.XM
+**Distribution:** $X.XX [monthly / quarterly] (prior $X.XX, ±X.X%)
+**Coverage (NII / distribution):** X.X%
+**NII:** $X.XXm ($X.XX per share)
+**Realized + unrealized P&L:** $X.XXm
+**Asset coverage / leverage:** X%
+**Preferreds outstanding:** ticker / series / par / coupon / call date
+**Debt outstanding:** aggregate / weighted-avg coupon / maturity ladder
+
+— NEW ISSUANCE (424B*, S-1, prospectus supplement) —
+**Product:** preferred stock | baby bond | senior note | structured note
+**Listing:** **PUBLIC (NYSE / NASDAQ)** symbol "X" — or — **UNLISTED**
+**Coupon:** X.XX% [fixed | floating | fixed-to-floating reset DATE]
+**Par:** $XX.XX
+**Maturity:** <date> or perpetual
+**First call:** <date> at <price>
+**Size:** $XXm
+**Use of proceeds:** paraphrase; if it names existing publicly traded securities to redeem, quote verbatim in the highlight block above
+**Change of control:** yes <terms> | no
+
+— REDEMPTION / CALL —
+**Series:** ticker / name
+**Redemption price:** $XX.XX [+ accrued]
+**Redemption date:** <date>
+**Notice date:** <date>
+**Source of funds:** if disclosed
+
+— DISTRIBUTION —
+**Security:** common | preferred series | baby bond
+**Declared:** $X.XX per share
+**Prior:** $X.XX per share (±X.X%)
+**Frequency:** monthly | quarterly
+**Ex-date:** <date>
+**Pay date:** <date>
+**Coverage (CEF / BDC):** NII / distribution X.X%
+
+— M&A —
+**Acquirer:** ...
+**Target:** ...
+**Deal price:** $XX.XX per share
+**Treatment of preferreds:** redeemed at par + accrued | assumed by successor | COC put at $X.XX
+**Treatment of baby bonds:** same scheme
+**Closing conditions / expected close:** ...
+
+— OTHER —
+2 to 4 sentences of plain prose covering the material content.
+
+Always end with:
+Link: <EDGAR URL>
 Accession: XXXXXXXXXX-XX-XXXXXX
 
-Total message must stay under 1800 characters. Plain text only — no markdown, no bold, no bullet points, no code fences.
+== CONSTRAINTS ==
+- Total message ≤ 1800 characters
+- Discord markdown: ## for highlight headers, ** for bold, > for blockquote
+- Verbatim quotes (with double quotes inside a > blockquote) ONLY inside the highlight block
+- The body uses paraphrase + key-value lines, NO blockquotes
+- Never invent figures, dates, or ticker symbols. If a field is not disclosed, write "n/d" or drop the line entirely
+- Include the highlight block ONLY when the trigger event is literally stated in the filing — when in doubt, omit
+- For CEFs and BDCs, prior-period comparisons matter — include them when disclosed
 
-FIXED-INCOME PRIORITIES — always lead with these if present:
-
-REDEMPTIONS / CALLS:
-State the series name/ticker, redemption price, redemption date, and whether accrued dividends are included.
-
-NEW ISSUANCES (424B2, 424B3, 424B5, S-1, prospectus supplements):
-State: product type (preferred stock / baby bond / note / structured note / other), security name, coupon or yield, par value, maturity date, first call date and call price, total issue size ($), exchange listing (NYSE/NASDAQ/OTC or unlisted), use of proceeds (does it retire existing securities?), change of control clause (yes/no and terms if stated).
-
-DISTRIBUTIONS:
-State current declared amount AND prior period amount if disclosed. Calculate % change. State frequency, ex-date, pay date. For CEFs/BDCs also state NII per share vs distribution (coverage ratio).
-
-M&A:
-State acquirer, target, deal price per share. Critically: what happens to existing preferred stock and baby bonds — redeemed at par + accrued? Change of control put triggered? Successor obligor? State the exact terms from the filing.
-
-CEF / BDC NAV REPORTS (NPORT, N-2, 10-Q, 10-K, 8-K with NAV):
-Current NAV per share + total net assets + total assets + total liabilities + shares outstanding.
-If prior period figures are disclosed: show both and the change.
-Distribution coverage: NII per share vs distribution per share (as a % if calculable).
-Any leverage ratio or asset coverage ratio disclosed.
-
-STRUCTURED PRODUCTS (FWP, 424B2 from banks like Citi, Goldman, JPMorgan, etc.):
-Product type (market-linked note, autocallable, buffer note, principal-protected, etc.), underlying index/stock, tenor/maturity, principal at risk (yes/no), key payout terms, minimum denomination, whether publicly listed on an exchange.
-
-TENDER OFFERS / EXCHANGE OFFERS:
-Security targeted, offer price, expiration date, conditions.
-
-IF NONE OF THE ABOVE APPLY:
-Still write 2-3 sentences summarizing what the filing covers. Never omit the Link and Accession lines.
-
-Emoji guide: 📄 new issuance | 🔔 redemption/call | ✂️ distribution cut/suspension | 💰 distribution raise | 📊 CEF/BDC NAV/financials | ⚠️ M&A/restructuring | 🔁 tender/exchange offer | 🏦 structured product | 📋 other"""
+== EMOJI GUIDE (the [EMOJI] at line 1) ==
+🚨 redemption / call of publicly traded security
+📢 new publicly listed issuance
+⚠️ M&A / change of control / restructuring
+🔁 tender / exchange offer
+💰 distribution raise
+✂️ distribution cut or suspension
+📊 CEF / BDC NAV or financials
+🏦 structured product (rare — pre-filter usually drops these)
+📄 other prospectus / new issuance
+📋 other / housekeeping
+👤 insider activity from tracked activist"""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -205,6 +281,10 @@ def send_discord_alert(content: str) -> None:
 # OpenRouter
 # ---------------------------------------------------------------------------
 
+class _ModelUnavailableError(RuntimeError):
+    """Raised when a model returns 404 — triggers fallback to next model."""
+
+
 def build_user_message(filing: dict) -> str:
     text = filing.get("filing_text", "") or ""
     if len(text) > MAX_TEXT_CHARS:
@@ -223,12 +303,6 @@ def build_user_message(filing: dict) -> str:
 
 
 def call_openrouter_model(filing: dict, model: str) -> str:
-    """
-    Call OpenRouter with a specific model.
-    Returns the model's text response.
-    Raises RuntimeError on unrecoverable error.
-    Raises ModelUnavailableError (subclass) on HTTP 404 so the caller can try the next model.
-    """
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
 
@@ -271,19 +345,18 @@ def call_openrouter_model(filing: dict, model: str) -> str:
             return content
 
         except _ModelUnavailableError:
-            raise  # propagate immediately so fallback logic kicks in
+            raise
 
         except urllib.error.HTTPError as e:
             body_snippet = e.read(300).decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {e.code}: {body_snippet}")
             if e.code in (404, 400):
-                # 404 = no endpoints; 400 = invalid model ID — both mean try next model
                 raise _ModelUnavailableError(f"Model unavailable ({model}): {body_snippet}")
             if e.code in (429, 500, 502, 503, 504):
                 log.warning(f"OpenRouter HTTP {e.code} on {model} (attempt {attempt}), retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
             else:
-                raise last_error  # other 4xx — won't recover
+                raise last_error
 
         except Exception as e:
             last_error = e
@@ -291,22 +364,11 @@ def call_openrouter_model(filing: dict, model: str) -> str:
                 log.warning(f"OpenRouter error on {model} (attempt {attempt}): {e}, retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
 
-    # All retries exhausted — treat as unavailable so outer loop tries next model
     raise _ModelUnavailableError(f"Model {model} failed after all attempts: {last_error}")
 
 
-class _ModelUnavailableError(RuntimeError):
-    """Raised when a model returns 404 — triggers fallback to next model."""
-
-
 def call_openrouter(filing: dict) -> str:
-    """
-    Try each model in MODEL_LIST in order.
-    Moves to the next model on 404 (model gone / no endpoints).
-    Raises RuntimeError only if every model fails.
-    """
     last_error: Exception | None = None
-
     for model in MODEL_LIST:
         try:
             result = call_openrouter_model(filing, model)
@@ -317,10 +379,8 @@ def call_openrouter(filing: dict) -> str:
             log.warning(f"Model unavailable, trying next fallback. ({e})")
             last_error = e
             continue
-        except Exception as e:
-            # Non-404 failure — don't try other models, surface the error
+        except Exception:
             raise
-
     raise last_error or RuntimeError("All models in fallback list exhausted")
 
 
@@ -342,13 +402,28 @@ def move_to_processed(filing_path: Path, prefix: str = "") -> None:
 # Dispatch one filing
 # ---------------------------------------------------------------------------
 
-def dispatch(filing_path: Path) -> None:
+def dispatch(filing_path: Path) -> bool:
+    """
+    Returns True if an LLM call was made (so the caller should rate-limit),
+    False if the filing was skipped by the pre-filter or errored before the call.
+    """
     try:
         filing = json.loads(filing_path.read_text(encoding="utf-8"))
     except Exception as e:
         log.error(f"Could not read {filing_path.name}: {e}")
         move_to_processed(filing_path, prefix="err_")
-        return
+        return False
+
+    # Pre-filter — drop obvious noise before spending tokens.
+    skip, reason = should_skip(filing)
+    if skip:
+        log.info(
+            f"SKIP {filing.get('ticker','UNKNOWN'):10s} | "
+            f"{filing.get('form_type',''):12s} | "
+            f"{filing.get('accession','')} — {reason}"
+        )
+        move_to_processed(filing_path, prefix="skip_")
+        return False
 
     ticker     = filing.get("ticker", "UNKNOWN")
     accession  = filing.get("accession", filing_path.stem)
@@ -369,7 +444,7 @@ def dispatch(filing_path: Path) -> None:
             f"`{accession}`"
         )
         move_to_processed(filing_path, prefix="err_")
-        return
+        return True  # we did spend an LLM call attempt; rate-limit anyway
 
     if not summary:
         log.error(f"Empty summary for {accession}")
@@ -380,7 +455,7 @@ def dispatch(filing_path: Path) -> None:
             f"`{accession}`"
         )
         move_to_processed(filing_path, prefix="err_")
-        return
+        return True
 
     if len(summary) > MAX_DISCORD_CHARS:
         summary = summary[:MAX_DISCORD_CHARS]
@@ -388,6 +463,7 @@ def dispatch(filing_path: Path) -> None:
     send_discord(summary, label=f"{ticker} / {accession}")
     log.info(f"Summary preview: {summary[:300]}")
     move_to_processed(filing_path)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -412,11 +488,15 @@ def main() -> None:
         log.info("No filings in inbox — nothing to dispatch.")
         return
 
-    log.info(f"Found {len(pending)} filing(s) to dispatch. Primary model: {MODEL_LIST[0]} ({len(MODEL_LIST)} fallbacks configured)")
+    log.info(
+        f"Found {len(pending)} filing(s). Primary model: {MODEL_LIST[0]} "
+        f"({len(MODEL_LIST)} fallbacks configured)"
+    )
     changed = False
+    sent_count = 0
+    skipped_count = 0
 
     for fp in pending:
-        # Read accession without fully loading the file
         try:
             raw_acc = json.loads(fp.read_text(encoding="utf-8")).get("accession", fp.stem)
         except Exception:
@@ -427,20 +507,24 @@ def main() -> None:
             move_to_processed(fp, prefix="dup_")
             continue
 
-        dispatch(fp)
+        called_llm = dispatch(fp)
         dispatched.add(raw_acc)
         changed = True
 
-        # Rate limiting: stay well under OpenRouter's 20 req/min free limit
-        time.sleep(SLEEP_BETWEEN_CALLS)
+        if called_llm:
+            sent_count += 1
+            time.sleep(SLEEP_BETWEEN_CALLS)
+        else:
+            skipped_count += 1
 
     if changed:
-        # Trim to last 10,000 to prevent unbounded growth
         if len(dispatched) > 10_000:
             dispatched = set(sorted(dispatched)[-10_000:])
         save_dispatched(dispatched)
 
-    log.info("Dispatch run complete.")
+    log.info(
+        f"Dispatch run complete. Dispatched={sent_count}, skipped={skipped_count}."
+    )
 
 
 if __name__ == "__main__":
