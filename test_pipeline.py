@@ -164,6 +164,76 @@ check(
 
 
 # ---------------------------------------------------------------------------
+# build_footer — posts must land on the document, not EDGAR's table of
+# contents. primary_doc_url was added to the payload Aug 2026; payloads
+# written before that (or where extraction failed) must still get a link.
+# ---------------------------------------------------------------------------
+print("\nbuild_footer / direct document links")
+
+WITH_DOC = dict(FILING, primary_doc_url="https://www.sec.gov/Archives/edgar/data/1176334/d123456d8k.htm")
+foot = dispatch.build_footer(WITH_DOC)
+check("document link is present and labelled", "Document: <" in foot)
+check("document link comes before the index link",
+      foot.index("Document:") < foot.index("Index:"))
+check("index page is retained as a secondary link", "Index: <" in foot)
+check("embeds are suppressed with angle brackets", foot.count("<http") == 2)
+
+legacy = dispatch.build_footer(FILING)          # no primary_doc_url key at all
+check("payload without primary_doc_url still gets a link", "Link: <" in legacy)
+check("legacy footer keeps the accession", FILING["accession"] in legacy)
+
+same = dispatch.build_footer(dict(FILING, primary_doc_url=FILING["filing_url"]))
+check("identical doc and index links are not duplicated", same.count("http") == 1)
+
+
+# ---------------------------------------------------------------------------
+# classify_priority — a redemption is worth interrupting a trading day for;
+# a NAV update is not. Prose mentioning a keyword must NOT trigger.
+# ---------------------------------------------------------------------------
+print("\nclassify_priority / routing")
+
+REDEMPTION = (
+    "\U0001F6A8 **ABR | 8-K | 2026-08-05** — Calls Series F.\n"
+    "## \U0001F6A8 REDEMPTION OF PUBLICLY TRADED SECURITY\n"
+    '> "will redeem all Series F at $25.00 plus accrued"'
+)
+NAV_ROUTINE = (
+    "\U0001F4CA **BGT | N-CSR | 2026-08-05** — NAV update.\n"
+    "**NAV:** $11.84 per share\n"
+    "The fund may permit redemption of shares at net asset value."
+)
+
+check("redemption classifies tier 1", dispatch.classify_priority(REDEMPTION) == (1, "redemption"))
+check("NAV report stays routine despite the word 'redemption'",
+      dispatch.classify_priority(NAV_ROUTINE)[0] == 0,
+      "prose must not trigger routing")
+check("lead emoji alone is enough",
+      dispatch.classify_priority("\U0001F501 **X | SC TO-I | 2026-08-05** — offer")[0] == 4)
+check("listing headline classifies tier 2",
+      dispatch.classify_priority(
+          "\U0001F4E2 **X | 424B5 | 2026-08-05** — new pfd\n## \U0001F4E2 LISTING: PUBLIC — NYSE")[0] == 2)
+check("M&A headline classifies tier 3",
+      dispatch.classify_priority(
+          "**X | 8-K | 2026-08-05** — merger\n## ⚠ M&A — CHANGE OF CONTROL")[0] == 3)
+check("plain housekeeping is routine",
+      dispatch.classify_priority("\U0001F4CB **X | 8-K** — bylaw amendment.")[0] == 0)
+check("redemption outranks a co-occurring M&A block",
+      dispatch.classify_priority(
+          "**X | 8-K** — merger\n## ⚠ M&A — CHANGE OF CONTROL\n"
+          "## \U0001F6A8 REDEMPTION OF PUBLICLY TRADED SECURITY") == (1, "redemption"))
+
+mentioned = dispatch.finalize_message(REDEMPTION, WITH_DOC, prefix="@here")
+check("mention prefix is prepended", mentioned.startswith("@here "))
+check("prefixed message still fits the cap", len(mentioned) <= dispatch.MAX_DISCORD_CHARS)
+check("prefixed message keeps its footer", "Document: <" in mentioned)
+
+huge = dispatch.finalize_message("\U0001F6A8 x" + ("y" * 4000), WITH_DOC, prefix="@here")
+check("prefix is accounted for when the body must be truncated",
+      len(huge) <= dispatch.MAX_DISCORD_CHARS, f"got {len(huge)}")
+check("footer survives a prefixed truncation", "Accession:" in huge)
+
+
+# ---------------------------------------------------------------------------
 # strip_reasoning — Nemotron 3 is a reasoning model. enable_thinking=false
 # should prevent chain-of-thought, but a leak would dump the model's
 # scratchpad into #sec-filings and eat the character budget.

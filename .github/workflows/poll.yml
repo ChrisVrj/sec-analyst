@@ -218,6 +218,14 @@ jobs:
         env:
           GITHUB_WORKSPACE:   ${{ github.workspace }}
           DISCORD_WEBHOOK:    ${{ secrets.DISCORD_WEBHOOK }}
+          # Optional priority routing. With DISCORD_WEBHOOK_URGENT set,
+          # redemptions / listings / M&A / tender offers go to that channel
+          # INSTEAD of the main one, so it stays pure signal and can carry
+          # push notifications. DISCORD_URGENT_MENTION (e.g. "@here" or
+          # "<@&ROLE_ID>") pings on those posts. Both unset = previous
+          # behaviour, everything in one channel with no pings.
+          DISCORD_WEBHOOK_URGENT: ${{ secrets.DISCORD_WEBHOOK_URGENT }}
+          DISCORD_URGENT_MENTION: ${{ vars.DISCORD_URGENT_MENTION }}
           # Primary provider: NVIDIA NIM (build.nvidia.com). ~40 req/min free,
           # no daily cap. Key expires ~6 months after issue — regenerate at
           # build.nvidia.com/settings/api-keys.

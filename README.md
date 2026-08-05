@@ -27,7 +27,11 @@ sec-poller/
 ├── edgar_poller.py          # polls EDGAR, writes matched filings to filings-inbox/
 ├── openrouter_dispatch.py   # reads inbox, calls NVIDIA NIM (OpenRouter fallback), posts to Discord
 │                           #   (filename is historical — it is provider-agnostic now)
+├── prefilter.py             # drops noise filings before any LLM call
+├── manage_watchlist.py      # add/remove tickers by symbol; edits cik_map.json
+├── test_pipeline.py         # offline regression suite
 ├── cik_map.json             # your watchlist: {"TICKER": "0001234567", ...}
+│                           #   SINGLE SOURCE OF TRUTH — never create a second copy
 ├── seen_accessions.json     # auto-managed, cached between runs
 ├── dispatched_accessions.json  # auto-managed, cached between runs
 └── .github/
@@ -53,6 +57,7 @@ Go to: **Settings → Secrets and variables → Actions → Secrets**
 | `DISCORD_WEBHOOK`    | yes      | Your full Discord webhook URL                      |
 | `NVIDIA_API_KEY`     | primary  | NVIDIA NIM key (`nvapi-...`) from [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys) |
 | `OPENROUTER_API_KEY` | fallback | OpenRouter key (`sk-or-v1-...`)                    |
+| `DISCORD_WEBHOOK_URGENT` | optional | Second webhook for priority events — see below |
 
 At least one of `NVIDIA_API_KEY` / `OPENROUTER_API_KEY` must be set or the
 dispatcher exits. Providers with no key are silently dropped from the chain,
@@ -125,6 +130,25 @@ served the filing.
 | OpenRouter free req/day  | 200          | Fallback only, so rarely approached        |
 | GitHub Actions (public)  | Unlimited    | No concern                                 |
 | GitHub Actions (private) | 2,000 min/mo | 100 filings × 7 min/run = ~700 min/mo ✅   |
+
+## Priority routing
+
+Redemptions, new listings, M&A and tender offers (priority 1–4) can be split
+off from routine NAV/distribution traffic.
+
+| Setting | Type | Effect |
+|---|---|---|
+| `DISCORD_WEBHOOK_URGENT` | secret | Priority events post **here instead of** the main channel |
+| `DISCORD_URGENT_MENTION` | variable | Prepended to priority posts, e.g. `@here` or `<@&ROLE_ID>` |
+
+Both are optional. With neither set, behaviour is unchanged — everything lands
+in one channel with no pings. Create a `#sec-urgent` channel, add its webhook,
+and turn on push notifications for that channel only.
+
+Classification reads the `##` highlight header and the line-1 emoji, not the
+body prose — a NAV report that mentions "redemption of shares at net asset
+value" in passing stays routine. If the urgent webhook fails, the post is
+retried on the main webhook rather than lost.
 
 ## Tests
 

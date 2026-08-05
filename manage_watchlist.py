@@ -43,7 +43,16 @@ USER_AGENT = f"sec-analyst watchlist tool {CONTACT_EMAIL}"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CIK_MAP_PATH = os.path.join(HERE, "cik_map.json")
+
+# The poller resolves the watchlist as BASE_DIR/cik_map.json where BASE_DIR is
+# GITHUB_WORKSPACE (the repo root). This tool MUST edit that same file.
+#
+# It previously lived in SEC Analyst/ and wrote to its own directory, so every
+# edit landed in a second copy the poller never read — EARN, NHP, FBYD, BMNR,
+# LILA and TPZ were "added" in Jun 2026 and silently never monitored, and the
+# BK->BNY / BCIC->PTMN relabels never took effect. Keep this path anchored to
+# the repo root; do not reintroduce a second cik_map.json anywhere.
+CIK_MAP_PATH = os.environ.get("CIK_MAP_PATH") or os.path.join(HERE, "cik_map.json")
 CACHE_PATH = os.path.join(HERE, "company_tickers_cache.json")
 CACHE_TTL_SECONDS = 24 * 60 * 60
 

@@ -78,7 +78,9 @@ logging.basicConfig(
     format="%(asctime)s [EDGAR-POLLER] %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        # Explicit UTF-8: entity names and filing text carry non-ASCII, and
+        # FileHandler otherwise uses the locale codepage (cp1252 on Windows).
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -302,7 +304,15 @@ def _fetch_url_text(url: str, timeout: int = 30) -> str:
         return ""
 
 
-def fetch_filing_text(accession_raw: str, cik: str) -> str:
+def fetch_filing_documents(accession_raw: str, cik: str) -> tuple[str, list[str]]:
+    """
+    Returns (concatenated_text, document_urls).
+
+    document_urls[0] is the primary document — the thing worth linking to.
+    The EDGAR *index* page that filing_url points at is only a table of
+    contents, so a Discord post carrying just that costs a second click to
+    reach any actual content.
+    """
     accession_clean = accession_raw.replace("-", "")
     cik_padded      = str(cik).zfill(10)
     index_url = (
@@ -316,12 +326,12 @@ def fetch_filing_text(accession_raw: str, cik: str) -> str:
             index_html = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         log.warning(f"Could not fetch index for {accession_raw}: {e}")
-        return ""
+        return "", []
 
     doc_urls = extract_document_urls(index_html, index_url)
     if not doc_urls:
         log.warning(f"No document URLs found for {accession_raw}")
-        return ""
+        return "", []
 
     parts = []
     for i, url in enumerate(doc_urls):
@@ -331,14 +341,22 @@ def fetch_filing_text(accession_raw: str, cik: str) -> str:
         if i < len(doc_urls) - 1:
             time.sleep(0.3)  # respect SEC rate limits between doc fetches
 
-    return "\n\n---\n\n".join(parts)
+    return "\n\n---\n\n".join(parts), doc_urls
+
+
+def fetch_filing_text(accession_raw: str, cik: str) -> str:
+    """Text-only wrapper, kept for local/ad-hoc use."""
+    return fetch_filing_documents(accession_raw, cik)[0]
 
 
 # ---------------------------------------------------------------------------
 # Write to inbox
 # ---------------------------------------------------------------------------
 
-def write_filing_payload(hit: dict, ticker: str, filing_text: str) -> None:
+def write_filing_payload(
+    hit: dict, ticker: str, filing_text: str, doc_urls: list[str] | None = None
+) -> None:
+    doc_urls = doc_urls or []
     payload = {
         "ticker":       ticker,
         "accession":    hit["accession"],
@@ -347,6 +365,10 @@ def write_filing_payload(hit: dict, ticker: str, filing_text: str) -> None:
         "form_type":    hit["form_type"],
         "file_date":    hit["file_date"],
         "filing_url":   hit["index_url"],
+        # Direct link to the actual document, so a Discord post lands on the
+        # filing text rather than EDGAR's table of contents.
+        "primary_doc_url": doc_urls[0] if doc_urls else "",
+        "exhibit_urls":    doc_urls[1:],
         "filing_text":  filing_text,
         "detected_at_utc": datetime.datetime.now(datetime.UTC).isoformat(),
     }
@@ -382,8 +404,8 @@ def poll_once(seen: set[str], watchlist: dict[str, str]) -> tuple[set[str], int]
             seen.add(accession)   # mark as seen so we don't re-check next cycle
             continue
 
-        ticker       = watchlist.get(cik, "UNKNOWN")
-        filing_text  = fetch_filing_text(accession, cik)
+        ticker                  = watchlist.get(cik, "UNKNOWN")
+        filing_text, doc_urls   = fetch_filing_documents(accession, cik)
 
         seen.add(accession)
 
@@ -392,7 +414,7 @@ def poll_once(seen: set[str], watchlist: dict[str, str]) -> tuple[set[str], int]
             save_seen(seen)
             continue
 
-        write_filing_payload(hit, ticker, filing_text)
+        write_filing_payload(hit, ticker, filing_text, doc_urls)
         queued += 1
 
         # Respect SEC rate guidance: max 10 req/sec, we stay well below.

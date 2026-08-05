@@ -62,6 +62,21 @@ NVIDIA_API_KEY     = os.environ.get("NVIDIA_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
+# ── Priority routing (optional) ────────────────────────────────────────────
+# A redemption of a security you hold is worth interrupting your day for; a
+# routine NAV update is not. Both are indistinguishable in a single busy
+# channel, so priority-1..4 events can be split off.
+#
+#   DISCORD_WEBHOOK_URGENT  second webhook (e.g. #sec-urgent). When set,
+#                           urgent filings go there INSTEAD of the main
+#                           channel, so that channel stays pure signal and
+#                           can carry push notifications. Unset = everything
+#                           goes to the main webhook, exactly as before.
+#   DISCORD_URGENT_MENTION  prepended to urgent posts, e.g. "@here" or
+#                           "<@&1234567890>" for a role. Unset = no ping.
+DISCORD_WEBHOOK_URGENT = os.environ.get("DISCORD_WEBHOOK_URGENT", "").strip()
+DISCORD_URGENT_MENTION = os.environ.get("DISCORD_URGENT_MENTION", "").strip()
+
 
 def _model_list(env_var: str, default: list[str]) -> list[str]:
     """Comma-separated env override, else the built-in chain. Order preserved,
@@ -294,7 +309,12 @@ logging.basicConfig(
     format="%(asctime)s [DISPATCH] %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        # encoding is explicit because summaries carry emoji (🚨, 📊, —) and
+        # FileHandler otherwise falls back to the locale codepage — cp1252 on
+        # Windows, where every log line with an emoji raises
+        # UnicodeEncodeError. Harmless on the Ubuntu runner, fatal for local
+        # debugging on Chris's machine.
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -330,10 +350,10 @@ def save_dispatched(dispatched: set[str]) -> None:
 # Discord
 # ---------------------------------------------------------------------------
 
-def post_discord(content: str) -> None:
+def post_discord(content: str, webhook: str = "") -> None:
     payload = json.dumps({"content": content}).encode("utf-8")
     req = urllib.request.Request(
-        DISCORD_WEBHOOK,
+        webhook or DISCORD_WEBHOOK,
         data=payload,
         headers={
             "Content-Type": "application/json",
@@ -350,13 +370,23 @@ def post_discord(content: str) -> None:
         raise RuntimeError(f"Discord HTTP {e.code}: {body}")
 
 
-def send_discord(content: str, label: str = "") -> None:
+def send_discord(content: str, label: str = "", webhook: str = "") -> None:
     try:
-        post_discord(content)
+        post_discord(content, webhook)
         if label:
             log.info(f"Posted to Discord: {label}")
     except Exception as e:
         log.error(f"Discord post failed ({label}): {e}")
+        # A dedicated urgent channel must never swallow an urgent filing. If
+        # its webhook is broken, fall back to the main channel rather than
+        # losing the one post that actually mattered.
+        if webhook and webhook != DISCORD_WEBHOOK and DISCORD_WEBHOOK:
+            log.warning(f"Retrying {label} on the main webhook")
+            try:
+                post_discord(content, DISCORD_WEBHOOK)
+                log.info(f"Posted to Discord (main, after urgent failed): {label}")
+            except Exception as e2:
+                log.error(f"Main-webhook fallback also failed ({label}): {e2}")
 
 
 def send_discord_alert(content: str) -> None:
@@ -546,6 +576,50 @@ def call_llm(filing: dict) -> tuple[str, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Priority classification
+#
+# Mirrors the PRIORITY ORDER in SYSTEM_PROMPT. Tiers 1-4 are exactly the
+# events the prompt allows a "## " highlight block for, and exactly the ones
+# worth interrupting a trading day: something is being called, listed, taken
+# over, or tendered for. Tiers 5+ (distributions, NAV updates, housekeeping)
+# are reading material, not action items.
+#
+# Detection order matters — a merger that also redeems preferreds should
+# classify as a redemption, which is why tier 1 is checked first.
+# ---------------------------------------------------------------------------
+
+URGENT_RULES: list[tuple[int, str, str, tuple[str, ...]]] = [
+    (1, "redemption",              "\U0001F6A8", ("REDEMPTION",)),
+    (2, "public listing",          "\U0001F4E2", ("LISTING:", "PROCEEDS WILL REDEEM")),
+    (3, "M&A / change of control", "⚠",     ("M&A", "CHANGE OF CONTROL")),
+    (4, "tender / exchange offer", "\U0001F501", ("TENDER", "EXCHANGE OFFER")),
+]
+
+
+def classify_priority(summary: str) -> tuple[int, str]:
+    """Returns (tier, label); tier 0 means routine.
+
+    Two independent signals, both anchored so prose can't trigger them:
+      · a '## ' highlight header containing the keyword — the strongest, since
+        the prompt only emits one when the trigger is literally in the filing
+      · the lead emoji on line 1
+
+    Deliberately NOT a substring search over the whole summary: a NAV report
+    mentioning "redemption of shares at NAV" in passing must stay routine.
+    """
+    lines       = summary.splitlines()
+    headers     = " ".join(l.upper() for l in lines if l.lstrip().startswith("#"))
+    first_line  = lines[0] if lines else ""
+
+    for tier, label, emoji, keywords in URGENT_RULES:
+        if any(k in headers for k in keywords):
+            return tier, label
+        if emoji and emoji in first_line:
+            return tier, label
+    return 0, ""
+
+
+# ---------------------------------------------------------------------------
 # Message assembly
 #
 # The Link/Accession footer is built from the filing payload, NOT from the
@@ -563,13 +637,29 @@ _MODEL_FOOTER_RE = re.compile(r"^[ \t]*(link|accession)[ \t]*:.*$", re.IGNORECAS
 
 
 def build_footer(filing: dict) -> str:
-    """Verified EDGAR link + accession. Angle brackets suppress Discord's
-    link-preview embed, which keeps #sec-filings scannable."""
+    """Verified EDGAR links + accession.
+
+    `primary_doc_url` goes first because it lands directly on the filing text;
+    `filing_url` is EDGAR's index page, which is only a table of contents and
+    costs a second click. The index link is kept as a secondary "Index:" line
+    since it's the route to exhibits the poller didn't fetch.
+
+    Angle brackets suppress Discord's link-preview embeds, keeping the channel
+    scannable.
+    """
     lines = []
-    url = (filing.get("filing_url", "") or "").strip()
-    acc = (filing.get("accession", "") or "").strip()
-    if url:
-        lines.append(f"Link: <{url}>")
+    doc   = (filing.get("primary_doc_url", "") or "").strip()
+    index = (filing.get("filing_url", "") or "").strip()
+    acc   = (filing.get("accession", "") or "").strip()
+
+    if doc:
+        lines.append(f"Document: <{doc}>")
+        if index and index != doc:
+            lines.append(f"Index: <{index}>")
+    elif index:
+        # Payload predates primary_doc_url, or extraction failed.
+        lines.append(f"Link: <{index}>")
+
     if acc:
         lines.append(f"Accession: {acc}")
     return "\n".join(lines)
@@ -607,16 +697,18 @@ def fit_to_budget(body: str, budget: int) -> str:
     return cut.rsplit(" ", 1)[0].rstrip(" ,;:-") + " …"
 
 
-def finalize_message(summary: str, filing: dict) -> str:
+def finalize_message(summary: str, filing: dict, prefix: str = "") -> str:
     body = _MODEL_FOOTER_RE.sub("", summary).strip()
     body = trim_long_lines(body)
 
+    head   = f"{prefix} " if prefix else ""
     footer = build_footer(filing)
-    if not footer:
-        return fit_to_budget(body, MAX_DISCORD_CHARS)
 
-    budget = MAX_DISCORD_CHARS - len(footer) - 2   # 2 for the joining newlines
-    return f"{fit_to_budget(body, budget)}\n\n{footer}"
+    # The prefix and footer are both fixed costs; only the body flexes.
+    budget = MAX_DISCORD_CHARS - len(head) - (len(footer) + 2 if footer else 0)
+    fitted = fit_to_budget(body, budget)
+
+    return f"{head}{fitted}\n\n{footer}" if footer else f"{head}{fitted}"
 
 
 # ---------------------------------------------------------------------------
@@ -682,9 +774,26 @@ def dispatch(filing_path: Path) -> int:
         move_to_processed(filing_path, prefix="err_")
         return DEFAULT_SLEEP  # attempts were spent; rate-limit anyway
 
-    message = finalize_message(summary, filing)
+    tier, priority_label = classify_priority(summary)
+    is_urgent = tier > 0
 
-    send_discord(message, label=f"{ticker} / {accession} via {provider['name']}")
+    prefix  = DISCORD_URGENT_MENTION if (is_urgent and DISCORD_URGENT_MENTION) else ""
+    webhook = DISCORD_WEBHOOK_URGENT if (is_urgent and DISCORD_WEBHOOK_URGENT) else ""
+    message = finalize_message(summary, filing, prefix=prefix)
+
+    if is_urgent:
+        log.info(
+            f"PRIORITY {tier} ({priority_label}) — {ticker} {accession} "
+            f"→ {'urgent webhook' if webhook else 'main webhook'}"
+            f"{' with mention' if prefix else ''}"
+        )
+
+    send_discord(
+        message,
+        label=f"{ticker} / {accession} via {provider['name']}"
+              f"{f' [P{tier} {priority_label}]' if is_urgent else ''}",
+        webhook=webhook,
+    )
     log.info(f"Summary preview: {message[:300]}")
     move_to_processed(filing_path)
     return provider["sleep"]
