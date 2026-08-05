@@ -1,26 +1,51 @@
 #!/usr/bin/env python3
 """
-OpenRouter dispatcher for the OpenClaw sec-analyst pipeline.
+LLM dispatcher for the OpenClaw sec-analyst pipeline.
+
+NOTE ON THE FILENAME: this module is no longer OpenRouter-only. It calls
+NVIDIA NIM (build.nvidia.com) first and falls back to OpenRouter. The name is
+kept because .github/workflows/poll.yml, README.md and AGENTS.md all
+reference it; treat "openrouter" in the filename as historical.
 
 Pipeline:
   1. Read all *.json filing payloads from filings-inbox/
   2. Pre-filter each filing against prefilter.should_skip (drops Form 3/4/5
      from non-activists and unlisted/structured 424B & FWP offerings)
-  3. For surviving filings, call OpenRouter with the sec-analyst prompt
+  3. For surviving filings, call the LLM with the sec-analyst prompt
   4. Post the structured summary to Discord via webhook
   5. Move processed filings to filings-inbox/processed/
   6. Send a Discord alert if a call fails or returns no content
   7. Persist dispatched accessions so restarts never duplicate posts
 
+Providers (tried in order, first one with a key configured wins):
+  - NVIDIA NIM   — https://integrate.api.nvidia.com/v1, key NVIDIA_API_KEY
+                   (nvapi-...). Free tier ≈ 40 req/min per model, no
+                   published daily cap. Keys expire after ~6 months and must
+                   be regenerated at build.nvidia.com/settings/api-keys.
+  - OpenRouter   — fallback only, key OPENROUTER_API_KEY (sk-or-v1-...).
+                   Free tier ≈ 20 req/min AND ≈ 200 req/day.
+
+Every attempt (provider, model) in ATTEMPTS is tried in order until one
+returns content. Missing keys simply drop that provider from the chain, so
+deleting OPENROUTER_API_KEY from GitHub Secrets cleanly disables the
+fallback without a code change.
+
+Nemotron 3 is a REASONING model. We send chat_template_kwargs
+{"enable_thinking": false} to suppress the chain-of-thought, and
+strip_reasoning() defensively removes any <think>...</think> block that
+leaks through anyway — an unstripped one would blow the 1900-char Discord
+cap and dump the model's scratchpad into #sec-filings.
+
 Rate limiting:
-  - OpenRouter free tier ≈ 20 req/min, 200 req/day
-  - SLEEP_BETWEEN_CALLS (default 4s) keeps us at ~15 req/min — safe margin
+  - SLEEP_BETWEEN_CALLS is per-provider (see PROVIDERS[...]["sleep"]) and is
+    applied based on which provider actually served the call
   - Pre-filtered (skipped) filings DO NOT count against the rate limit
 """
 
 import json
 import logging
 import os
+import re
 import time
 import urllib.request
 import urllib.error
@@ -33,30 +58,84 @@ from prefilter import should_skip
 # Config — all secrets come from environment variables (GitHub Secrets)
 # ---------------------------------------------------------------------------
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+NVIDIA_API_KEY     = os.environ.get("NVIDIA_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 DISCORD_WEBHOOK    = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
-MODEL = os.environ.get(
-    "OPENROUTER_MODEL",
-    "meta-llama/llama-3.3-70b-instruct:free",
-)
 
-FALLBACK_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-4-31b-it:free",
-    "openai/gpt-oss-120b:free",
-    "openai/gpt-oss-20b:free",
-    "meta-llama/llama-3.2-3b-instruct:free",
+def _model_list(env_var: str, default: list[str]) -> list[str]:
+    """Comma-separated env override, else the built-in chain. Order preserved,
+    duplicates dropped so an override that repeats a default costs nothing."""
+    raw = os.environ.get(env_var, "").strip()
+    models = [m.strip() for m in raw.split(",") if m.strip()] if raw else list(default)
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in models:
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
+
+
+# NVIDIA NIM model chain. Verify these IDs against your own key with:
+#   curl -H "Authorization: Bearer $NVIDIA_API_KEY" \
+#        https://integrate.api.nvidia.com/v1/models
+# NVIDIA renames/retires model IDs without notice; a 404 just falls through to
+# the next entry, so a stale ID degrades rather than breaks.
+NVIDIA_MODELS = _model_list("NVIDIA_MODELS", [
+    "nvidia/nemotron-3-super-120b-a12b",   # 120B MoE, 1M ctx — the workhorse
+    "nvidia/nemotron-3-ultra-550b-a55b",   # 550B MoE — slower, use if Super is busy
+    "nvidia/nemotron-3-nano-30b-a3b",      # fast/cheap last resort
+])
+
+# OpenRouter chain — fallback only. OPENROUTER_MODEL still honoured as the
+# primary of this chain for backwards compatibility with the existing repo var.
+_OR_PRIMARY = os.environ.get("OPENROUTER_MODEL", "").strip()
+OPENROUTER_MODELS = _model_list("OPENROUTER_MODELS", [
+    m for m in [
+        _OR_PRIMARY,
+        "openai/gpt-oss-120b:free",           # empirically the most available
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemma-4-31b-it:free",
+        "openai/gpt-oss-20b:free",
+        "meta-llama/llama-3.2-3b-instruct:free",
+    ] if m
+])
+
+PROVIDERS = [
+    {
+        "name":    "nvidia",
+        "url":     "https://integrate.api.nvidia.com/v1/chat/completions",
+        "key":     NVIDIA_API_KEY,
+        "models":  NVIDIA_MODELS,
+        "headers": {"Accept": "application/json"},
+        # Suppress Nemotron's chain-of-thought. Sent top-level, which is where
+        # the OpenAI SDK's extra_body= puts it.
+        "extra":   {"chat_template_kwargs": {"enable_thinking": False}},
+        "sleep":   2,   # free tier ~40 req/min → 30/min leaves margin
+    },
+    {
+        "name":    "openrouter",
+        "url":     "https://openrouter.ai/api/v1/chat/completions",
+        "key":     OPENROUTER_API_KEY,
+        "models":  OPENROUTER_MODELS,
+        "headers": {
+            "HTTP-Referer": "https://github.com/openclaw/sec-poller",
+            "X-Title":      "OpenClaw SEC Analyst",
+        },
+        "extra":   {},
+        "sleep":   4,   # free tier ~20 req/min → 15/min leaves margin
+    },
 ]
 
-_seen: set[str] = set()
-MODEL_LIST: list[str] = []
-for _m in [MODEL] + FALLBACK_MODELS:
-    if _m not in _seen:
-        MODEL_LIST.append(_m)
-        _seen.add(_m)
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Flattened (provider, model) attempt order. Providers without a key are
+# dropped entirely, so removing a secret disables that provider cleanly.
+ATTEMPTS = [
+    (p, m)
+    for p in PROVIDERS
+    if p["key"] and p["models"]
+    for m in p["models"]
+]
 
 BASE_DIR        = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).parent))
 INBOX_DIR       = BASE_DIR / "filings-inbox"
@@ -67,7 +146,7 @@ DISPATCHED_FILE = BASE_DIR / "dispatched_accessions.json"
 MAX_TOKENS          = 900
 MAX_TEXT_CHARS      = 400_000
 MAX_DISCORD_CHARS   = 1_900
-SLEEP_BETWEEN_CALLS = 4
+DEFAULT_SLEEP       = 4
 MAX_RETRIES         = 1
 RETRY_DELAY         = 3
 REQUEST_TIMEOUT     = 90
@@ -278,11 +357,35 @@ def send_discord_alert(content: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OpenRouter
+# LLM providers
 # ---------------------------------------------------------------------------
 
 class _ModelUnavailableError(RuntimeError):
-    """Raised when a model returns 404 — triggers fallback to next model."""
+    """Raised on 400/404 — triggers fallback to the next model."""
+
+
+class _ProviderUnavailableError(RuntimeError):
+    """Raised on 401/403 — skip every remaining model on that provider."""
+
+
+# Nemotron emits <think>...</think> when thinking isn't fully suppressed.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(content: str) -> str:
+    """Remove chain-of-thought that leaked into the message content.
+
+    enable_thinking=false should prevent this, but a model that ignores the
+    flag would otherwise dump its scratchpad into #sec-filings and eat the
+    1900-char budget. Handles the unterminated case too (thinking that ran
+    past max_tokens leaves an opening <think> with no closer).
+    """
+    content = _THINK_RE.sub("", content)
+    if "<think>" in content.lower():
+        idx = content.lower().rindex("<think>")
+        # Unclosed tag: keep whatever came before it, drop the rest.
+        content = content[:idx]
+    return content.replace("</think>", "").strip()
 
 
 def build_user_message(filing: dict) -> str:
@@ -302,58 +405,81 @@ def build_user_message(filing: dict) -> str:
     )
 
 
-def call_openrouter_model(filing: dict, model: str) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not set")
-
-    body = json.dumps({
+def _post_chat(provider: dict, model: str, filing: dict, extra: dict) -> str:
+    """One HTTP round-trip. Raises on any failure."""
+    payload = {
         "model":      model,
         "max_tokens": MAX_TOKENS,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": build_user_message(filing)},
         ],
-    }).encode("utf-8")
+        **extra,
+    }
 
     req = urllib.request.Request(
-        OPENROUTER_URL,
-        data=body,
+        provider["url"],
+        data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {provider['key']}",
             "Content-Type":  "application/json",
-            "HTTP-Referer":  "https://github.com/openclaw/sec-poller",
-            "X-Title":       "OpenClaw SEC Analyst",
+            **provider["headers"],
         },
         method="POST",
     )
 
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        data = json.loads(resp.read())
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError(f"{provider['name']} returned no choices: {data}")
+
+    message = choices[0].get("message") or {}
+    content = strip_reasoning(message.get("content") or "")
+
+    # Reasoning models may return the whole answer in reasoning_content when
+    # content comes back empty — better to salvage it than alert on nothing.
+    if not content:
+        content = strip_reasoning(message.get("reasoning_content") or "")
+        if content:
+            log.warning(f"{provider['name']}/{model}: answer arrived in reasoning_content")
+
+    if not content:
+        raise ValueError(f"{provider['name']} returned empty content")
+
+    return content
+
+
+def call_model(filing: dict, provider: dict, model: str) -> str:
+    label      = f"{provider['name']}/{model}"
+    extra      = dict(provider["extra"])
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 2):
         try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                data = json.loads(resp.read())
-
-            choices = data.get("choices") or []
-            if not choices:
-                raise ValueError(f"OpenRouter returned no choices: {data}")
-
-            content = (choices[0].get("message") or {}).get("content", "").strip()
-            if not content:
-                raise ValueError("OpenRouter returned empty content")
-
-            return content
-
-        except _ModelUnavailableError:
-            raise
+            return _post_chat(provider, model, filing, extra)
 
         except urllib.error.HTTPError as e:
             body_snippet = e.read(300).decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {e.code}: {body_snippet}")
-            if e.code in (404, 400):
-                raise _ModelUnavailableError(f"Model unavailable ({model}): {body_snippet}")
+
+            # A 400 caused by our chat_template_kwargs (model doesn't accept
+            # the thinking toggle) is recoverable — retry the same model plain
+            # rather than burning the whole chain on a param the model rejects.
+            if e.code == 400 and extra and _rejects_extra(body_snippet):
+                log.warning(f"{label}: rejected {list(extra)}, retrying without it")
+                extra = {}
+                continue
+
+            if e.code in (400, 404):
+                raise _ModelUnavailableError(f"Model unavailable ({label}): {body_snippet}")
+            if e.code in (401, 403):
+                # Bad/expired key — every model on this provider will fail the
+                # same way, so skip straight to the next provider.
+                raise _ProviderUnavailableError(f"Auth failed for {provider['name']}: {body_snippet}")
             if e.code in (429, 500, 502, 503, 504):
-                log.warning(f"OpenRouter HTTP {e.code} on {model} (attempt {attempt}), retrying in {RETRY_DELAY}s...")
+                log.warning(f"{label} HTTP {e.code} (attempt {attempt}), retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
             else:
                 raise last_error
@@ -361,27 +487,52 @@ def call_openrouter_model(filing: dict, model: str) -> str:
         except Exception as e:
             last_error = e
             if attempt <= MAX_RETRIES:
-                log.warning(f"OpenRouter error on {model} (attempt {attempt}): {e}, retrying in {RETRY_DELAY}s...")
+                log.warning(f"{label} error (attempt {attempt}): {e}, retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
 
-    raise _ModelUnavailableError(f"Model {model} failed after all attempts: {last_error}")
+    raise _ModelUnavailableError(f"{label} failed after all attempts: {last_error}")
 
 
-def call_openrouter(filing: dict) -> str:
+def _rejects_extra(body_snippet: str) -> bool:
+    low = body_snippet.lower()
+    return any(s in low for s in (
+        "chat_template_kwargs", "enable_thinking",
+        "extra_forbidden", "unrecognized", "unknown field",
+        "additional properties", "unexpected keyword",
+    ))
+
+
+def call_llm(filing: dict) -> tuple[str, dict]:
+    """Try every (provider, model) in order. Returns (summary, provider)."""
+    if not ATTEMPTS:
+        raise RuntimeError("No LLM provider configured — set NVIDIA_API_KEY or OPENROUTER_API_KEY")
+
     last_error: Exception | None = None
-    for model in MODEL_LIST:
+    dead_providers: set[str] = set()
+
+    for provider, model in ATTEMPTS:
+        if provider["name"] in dead_providers:
+            continue
         try:
-            result = call_openrouter_model(filing, model)
-            if model != MODEL_LIST[0]:
-                log.info(f"Fallback succeeded with model: {model}")
-            return result
+            result = call_model(filing, provider, model)
+            if (provider, model) != ATTEMPTS[0]:
+                log.info(f"Fallback succeeded with {provider['name']}/{model}")
+            return result, provider
+
+        except _ProviderUnavailableError as e:
+            log.error(f"Provider {provider['name']} unusable, skipping its models. ({e})")
+            dead_providers.add(provider["name"])
+            last_error = e
+
         except _ModelUnavailableError as e:
             log.warning(f"Model unavailable, trying next fallback. ({e})")
             last_error = e
-            continue
-        except Exception:
-            raise
-    raise last_error or RuntimeError("All models in fallback list exhausted")
+
+        except Exception as e:
+            log.warning(f"{provider['name']}/{model} failed: {e}")
+            last_error = e
+
+    raise last_error or RuntimeError("All provider/model combinations exhausted")
 
 
 # ---------------------------------------------------------------------------
@@ -402,17 +553,18 @@ def move_to_processed(filing_path: Path, prefix: str = "") -> None:
 # Dispatch one filing
 # ---------------------------------------------------------------------------
 
-def dispatch(filing_path: Path) -> bool:
+def dispatch(filing_path: Path) -> int:
     """
-    Returns True if an LLM call was made (so the caller should rate-limit),
-    False if the filing was skipped by the pre-filter or errored before the call.
+    Returns the number of seconds the caller should sleep before the next
+    filing — the serving provider's rate-limit spacing, or 0 when no LLM call
+    was made (pre-filtered, or unreadable before the call).
     """
     try:
         filing = json.loads(filing_path.read_text(encoding="utf-8"))
     except Exception as e:
         log.error(f"Could not read {filing_path.name}: {e}")
         move_to_processed(filing_path, prefix="err_")
-        return False
+        return 0
 
     # Pre-filter — drop obvious noise before spending tokens.
     skip, reason = should_skip(filing)
@@ -423,7 +575,7 @@ def dispatch(filing_path: Path) -> bool:
             f"{filing.get('accession','')} — {reason}"
         )
         move_to_processed(filing_path, prefix="skip_")
-        return False
+        return 0
 
     ticker     = filing.get("ticker", "UNKNOWN")
     accession  = filing.get("accession", filing_path.stem)
@@ -434,36 +586,25 @@ def dispatch(filing_path: Path) -> bool:
     log.info(f"Dispatching {ticker:10s} | {form_type:12s} | {accession}")
 
     try:
-        summary = call_openrouter(filing)
+        summary, provider = call_llm(filing)
     except Exception as e:
-        log.error(f"OpenRouter failed for {accession}: {e}")
+        log.error(f"All LLM providers failed for {accession}: {e}")
         send_discord_alert(
             f"❌ **{ticker}** | {form_type} | {file_date}\n"
-            f"OpenRouter error: {str(e)[:200]}\n"
+            f"LLM error: {str(e)[:200]}\n"
             f"Manual review: <{edgar_url}>\n"
             f"`{accession}`"
         )
         move_to_processed(filing_path, prefix="err_")
-        return True  # we did spend an LLM call attempt; rate-limit anyway
-
-    if not summary:
-        log.error(f"Empty summary for {accession}")
-        send_discord_alert(
-            f"⚠️ **{ticker}** | {form_type} | {file_date}\n"
-            f"Model returned no content.\n"
-            f"Manual review: <{edgar_url}>\n"
-            f"`{accession}`"
-        )
-        move_to_processed(filing_path, prefix="err_")
-        return True
+        return DEFAULT_SLEEP  # attempts were spent; rate-limit anyway
 
     if len(summary) > MAX_DISCORD_CHARS:
         summary = summary[:MAX_DISCORD_CHARS]
 
-    send_discord(summary, label=f"{ticker} / {accession}")
+    send_discord(summary, label=f"{ticker} / {accession} via {provider['name']}")
     log.info(f"Summary preview: {summary[:300]}")
     move_to_processed(filing_path)
-    return True
+    return provider["sleep"]
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +612,17 @@ def dispatch(filing_path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not OPENROUTER_API_KEY:
-        log.error("OPENROUTER_API_KEY environment variable is not set. Exiting.")
+    if not ATTEMPTS:
+        log.error(
+            "No LLM provider configured. Set NVIDIA_API_KEY (preferred) "
+            "and/or OPENROUTER_API_KEY. Exiting."
+        )
         raise SystemExit(1)
+
+    if not NVIDIA_API_KEY:
+        log.warning("NVIDIA_API_KEY not set — running on OpenRouter only.")
+    if not OPENROUTER_API_KEY:
+        log.warning("OPENROUTER_API_KEY not set — no fallback provider.")
 
     if not DISCORD_WEBHOOK:
         log.error("DISCORD_WEBHOOK environment variable is not set. Exiting.")
@@ -488,9 +637,10 @@ def main() -> None:
         log.info("No filings in inbox — nothing to dispatch.")
         return
 
+    first_provider, first_model = ATTEMPTS[0]
     log.info(
-        f"Found {len(pending)} filing(s). Primary model: {MODEL_LIST[0]} "
-        f"({len(MODEL_LIST)} fallbacks configured)"
+        f"Found {len(pending)} filing(s). Primary: {first_provider['name']}/{first_model} "
+        f"({len(ATTEMPTS)} provider/model combinations configured)"
     )
     changed = False
     sent_count = 0
@@ -507,13 +657,13 @@ def main() -> None:
             move_to_processed(fp, prefix="dup_")
             continue
 
-        called_llm = dispatch(fp)
+        sleep_for = dispatch(fp)
         dispatched.add(raw_acc)
         changed = True
 
-        if called_llm:
+        if sleep_for:
             sent_count += 1
-            time.sleep(SLEEP_BETWEEN_CALLS)
+            time.sleep(sleep_for)
         else:
             skipped_count += 1
 

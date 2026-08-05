@@ -1,43 +1,102 @@
 name: EDGAR SEC Poller
 
-on:
-  # Poll every 30 minutes, Mon–Fri, 6am–10pm ET (= 11:00–03:00 UTC next day)
-  # GitHub cron is UTC. EDGAR hours are 6am-10pm ET = UTC-4 in summer, UTC-5 in winter.
-  # This schedule covers 10:00 UTC – 02:30 UTC (next day), Mon–Fri.
-  # The poller script also checks edgar_is_open() itself as a second guard.
-  schedule:
-    - cron: '*/30 10-23 * * 1-5'   # Mon–Fri, 10:00–23:30 UTC (covers 6am–7:30pm ET)
-    - cron: '*/30 0-2  * * 2-6'    # Tue–Sat, 00:00–02:30 UTC (covers 8pm–10:30pm ET previous day)
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY */5 * * * * instead of targeted crons?
+#
+# GitHub throttles scheduled workflows on low-activity repos, causing runs to
+# fire every 1-2 hours instead of every 5 minutes. A single high-frequency
+# cron keeps the workflow "hot" so GitHub honours the cadence reliably.
+#
+# The time-window check is done in bash (step 1). All subsequent steps carry
+# an  if: steps.window.outputs.proceed == 'true'  guard so they are skipped
+# instantly when the job fires outside the Sofia trading windows.
+#
+# Trading windows (Sofia local time):
+#   Window 1 : 11:00 AM – 04:30 PM
+#   Window 2 : 11:00 PM – 01:30 AM (next day)
+#
+# UTC equivalents (EEST = UTC+3, summer):
+#   Window 1 : 08:00 – 13:30 UTC  →  480 – 810  min
+#   Window 2 : 20:00 – 22:30 UTC  → 1200 – 1350 min
+#
+# ⚠ When clocks go back to EET (UTC+2, late Oct – late Mar):
+#   Set W1_START=540 W1_END=870 W2_START=1260 W2_END=1410
+# ─────────────────────────────────────────────────────────────────────────────
 
-  # Allow manual trigger for testing
-  workflow_dispatch:
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 min 24/7 — window check below keeps it clean
+  workflow_dispatch:         # manual trigger for testing
 
 jobs:
   poll-and-dispatch:
     runs-on: ubuntu-latest
-    timeout-minutes: 60    # Safety ceiling: 3000 filings/month = ~100/day, 4s each ≈ 7 min/run
+    timeout-minutes: 10
 
     steps:
-      # -----------------------------------------------------------------------
-      # 1. Checkout repo
-      # -----------------------------------------------------------------------
+      # ── 1. Check trading window ────────────────────────────────────────────
+      - name: Check trading window
+        id: window
+        run: |
+          HOUR_UTC=$(date -u +%-H)
+          MIN_UTC=$(date -u  +%-M)
+          TIME_UTC=$(( HOUR_UTC * 60 + MIN_UTC ))
+          DOW=$(date -u +%u)   # 1=Mon … 7=Sun
+
+          echo "UTC $(date -u '+%H:%M')  DOW=$DOW  min=$TIME_UTC"
+
+          PROCEED=false
+
+          # Manual runs bypass the window check — otherwise there is no way to
+          # test outside Sofia trading hours, which is exactly when you're
+          # usually sitting down to test. edgar_poller.py's own edgar_is_open()
+          # is still a second guard (it blocks outside 6am-10pm ET).
+          #
+          # NOTE: this sets PROCEED and falls through to the single
+          # $GITHUB_OUTPUT write at the bottom. Do NOT "simplify" this to an
+          # `exit 0` early-return — see AGENTS.md §6: exit codes only end the
+          # current step, later steps run regardless, so the guard would
+          # silently stop working.
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run — bypassing trading-window check."
+            PROCEED=true
+          elif [ "$DOW" -lt 6 ]; then
+            # ── EEST (UTC+3) ──────────────────────────────────────────────
+            W1_START=480    # 08:00 UTC = 11:00 Sofia
+            W1_END=810      # 13:30 UTC = 16:30 Sofia
+            W2_START=1200   # 20:00 UTC = 23:00 Sofia
+            W2_END=1350     # 22:30 UTC = 01:30 Sofia (+1)
+
+            if   [ "$TIME_UTC" -ge "$W1_START" ] && [ "$TIME_UTC" -lt "$W1_END" ]; then
+              echo "Window 1 — proceeding."
+              PROCEED=true
+            elif [ "$TIME_UTC" -ge "$W2_START" ] && [ "$TIME_UTC" -lt "$W2_END" ]; then
+              echo "Window 2 — proceeding."
+              PROCEED=true
+            else
+              echo "Outside windows — skipping."
+            fi
+          else
+            echo "Weekend — skipping."
+          fi
+
+          echo "proceed=$PROCEED" >> "$GITHUB_OUTPUT"
+
+      # ── 2. Checkout ────────────────────────────────────────────────────────
       - name: Checkout
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # 2. Set up Python
-      # -----------------------------------------------------------------------
+      # ── 3. Python ──────────────────────────────────────────────────────────
       - name: Set up Python
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # -----------------------------------------------------------------------
-      # 3. Restore seen_accessions cache
-      #    Key includes run_id so each run saves a fresh entry.
-      #    restore-keys grabs the most recent previous run's cache if no exact match.
-      # -----------------------------------------------------------------------
+      # ── 4. Restore caches ──────────────────────────────────────────────────
       - name: Restore seen accessions cache
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/cache@v4
         with:
           path: seen_accessions.json
@@ -45,10 +104,8 @@ jobs:
           restore-keys: |
             seen-accessions-
 
-      # -----------------------------------------------------------------------
-      # 4. Restore dispatched accessions cache
-      # -----------------------------------------------------------------------
       - name: Restore dispatched accessions cache
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/cache@v4
         with:
           path: dispatched_accessions.json
@@ -56,41 +113,55 @@ jobs:
           restore-keys: |
             dispatched-accessions-
 
-      # -----------------------------------------------------------------------
-      # 5. Run EDGAR poller (--once mode: poll once, write inbox files, exit)
-      # -----------------------------------------------------------------------
-      - name: Run EDGAR poller
-        run: python edgar_poller.py --once
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      # -----------------------------------------------------------------------
-      # 6. Check how many filings are in the inbox
-      # -----------------------------------------------------------------------
-      - name: Count inbox filings
-        id: inbox_count
+      # ── 5. Poll + dispatch loop (runs for ~4 min, polls every 30 s) ────────
+      - name: Poll and dispatch loop
+        if: steps.window.outputs.proceed == 'true'
         run: |
-          COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Inbox count: $COUNT"
+          END_TIME=$(( $(date +%s) + 240 ))
+          POLL=0
 
-      # -----------------------------------------------------------------------
-      # 7. Run dispatcher (only if there are filings to process)
-      # -----------------------------------------------------------------------
-      - name: Run OpenRouter dispatcher
-        if: steps.inbox_count.outputs.count != '0'
-        run: python openrouter_dispatch.py
+          while [ $(date +%s) -lt $END_TIME ]; do
+            POLL=$(( POLL + 1 ))
+            echo "──── Poll #$POLL at $(date -u '+%H:%M:%S UTC') ────"
+
+            python edgar_poller.py --once
+
+            COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+            echo "Inbox: $COUNT filing(s)"
+
+            if [ "$COUNT" -gt "0" ]; then
+              python openrouter_dispatch.py
+            fi
+
+            REMAINING=$(( END_TIME - $(date +%s) ))
+            if [ $REMAINING -gt 30 ]; then
+              sleep 30
+            elif [ $REMAINING -gt 5 ]; then
+              sleep 5
+            else
+              break
+            fi
+          done
+
+          echo "Loop complete after $POLL poll(s)."
         env:
-          GITHUB_WORKSPACE:    ${{ github.workspace }}
-          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
-          DISCORD_WEBHOOK:     ${{ secrets.DISCORD_WEBHOOK }}
-          OPENROUTER_MODEL:    ${{ vars.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free' }}
+          GITHUB_WORKSPACE:   ${{ github.workspace }}
+          DISCORD_WEBHOOK:    ${{ secrets.DISCORD_WEBHOOK }}
+          # Primary provider: NVIDIA NIM (build.nvidia.com). ~40 req/min free,
+          # no daily cap. Key expires ~6 months after issue — regenerate at
+          # build.nvidia.com/settings/api-keys.
+          NVIDIA_API_KEY:     ${{ secrets.NVIDIA_API_KEY }}
+          # Fallback provider. Delete this secret to disable OpenRouter
+          # entirely — the dispatcher drops providers with no key.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Optional comma-separated overrides for either chain; defaults live
+          # in openrouter_dispatch.py.
+          NVIDIA_MODELS:      ${{ vars.NVIDIA_MODELS }}
+          OPENROUTER_MODEL:   ${{ vars.OPENROUTER_MODEL }}
 
-      # -----------------------------------------------------------------------
-      # 8. Upload logs as artifact (visible in Actions UI for 7 days)
-      # -----------------------------------------------------------------------
+      # ── 6. Upload logs (always, even on failure) ───────────────────────────
       - name: Upload logs
-        if: always()
+        if: steps.window.outputs.proceed == 'true' && always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ github.run_id }}

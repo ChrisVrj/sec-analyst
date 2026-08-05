@@ -47,7 +47,20 @@ jobs:
 
           PROCEED=false
 
-          if [ "$DOW" -lt 6 ]; then
+          # Manual runs bypass the window check — otherwise there is no way to
+          # test outside Sofia trading hours, which is exactly when you're
+          # usually sitting down to test. edgar_poller.py's own edgar_is_open()
+          # is still a second guard (it blocks outside 6am-10pm ET).
+          #
+          # NOTE: this sets PROCEED and falls through to the single
+          # $GITHUB_OUTPUT write at the bottom. Do NOT "simplify" this to an
+          # `exit 0` early-return — see AGENTS.md §6: exit codes only end the
+          # current step, later steps run regardless, so the guard would
+          # silently stop working.
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run — bypassing trading-window check."
+            PROCEED=true
+          elif [ "$DOW" -lt 6 ]; then
             # ── EEST (UTC+3) ──────────────────────────────────────────────
             W1_START=480    # 08:00 UTC = 11:00 Sofia
             W1_END=810      # 13:30 UTC = 16:30 Sofia
@@ -133,9 +146,18 @@ jobs:
           echo "Loop complete after $POLL poll(s)."
         env:
           GITHUB_WORKSPACE:   ${{ github.workspace }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           DISCORD_WEBHOOK:    ${{ secrets.DISCORD_WEBHOOK }}
-          OPENROUTER_MODEL:   ${{ vars.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free' }}
+          # Primary provider: NVIDIA NIM (build.nvidia.com). ~40 req/min free,
+          # no daily cap. Key expires ~6 months after issue — regenerate at
+          # build.nvidia.com/settings/api-keys.
+          NVIDIA_API_KEY:     ${{ secrets.NVIDIA_API_KEY }}
+          # Fallback provider. Delete this secret to disable OpenRouter
+          # entirely — the dispatcher drops providers with no key.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Optional comma-separated overrides for either chain; defaults live
+          # in openrouter_dispatch.py.
+          NVIDIA_MODELS:      ${{ vars.NVIDIA_MODELS }}
+          OPENROUTER_MODEL:   ${{ vars.OPENROUTER_MODEL }}
 
       # ── 6. Upload logs (always, even on failure) ───────────────────────────
       - name: Upload logs

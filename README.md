@@ -1,15 +1,19 @@
 # sec-poller
 
-GitHub Actions–based SEC filing monitor. Polls EDGAR every 30 minutes during
-market hours, matches filings against your watchlist, calls OpenRouter for an
-AI summary, and posts to Discord.
+GitHub Actions–based SEC filing monitor. Polls EDGAR during your trading
+windows, matches filings against your watchlist, calls an LLM for a
+fixed-income-analyst summary, and posts to Discord.
+
+The LLM is **NVIDIA Nemotron 3** via NVIDIA NIM (free, ~40 req/min, no daily
+cap), with **OpenRouter free models as an automatic fallback**.
 
 ## Repository structure
 
 ```
 sec-poller/
 ├── edgar_poller.py          # polls EDGAR, writes matched filings to filings-inbox/
-├── openrouter_dispatch.py   # reads inbox, calls OpenRouter, posts to Discord
+├── openrouter_dispatch.py   # reads inbox, calls NVIDIA NIM (OpenRouter fallback), posts to Discord
+│                           #   (filename is historical — it is provider-agnostic now)
 ├── cik_map.json             # your watchlist: {"TICKER": "0001234567", ...}
 ├── seen_accessions.json     # auto-managed, cached between runs
 ├── dispatched_accessions.json  # auto-managed, cached between runs
@@ -31,22 +35,42 @@ Push all files from this directory to the root of the repo.
 
 Go to: **Settings → Secrets and variables → Actions → Secrets**
 
-| Secret name          | Value                                      |
-|----------------------|--------------------------------------------|
-| `OPENROUTER_API_KEY` | Your OpenRouter API key (`sk-or-v1-...`)   |
-| `DISCORD_WEBHOOK`    | Your full Discord webhook URL              |
+| Secret name          | Required | Value                                              |
+|----------------------|----------|----------------------------------------------------|
+| `DISCORD_WEBHOOK`    | yes      | Your full Discord webhook URL                      |
+| `NVIDIA_API_KEY`     | primary  | NVIDIA NIM key (`nvapi-...`) from [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys) |
+| `OPENROUTER_API_KEY` | fallback | OpenRouter key (`sk-or-v1-...`)                    |
 
-### 3. (Optional) Set the model via a variable
+At least one of `NVIDIA_API_KEY` / `OPENROUTER_API_KEY` must be set or the
+dispatcher exits. Providers with no key are silently dropped from the chain,
+so **deleting a secret is how you disable a provider** — no code change needed.
+
+> ⚠️ **NVIDIA keys expire ~6 months after issue.** When that happens the
+> dispatcher logs an auth failure, skips the whole NVIDIA chain, and quietly
+> keeps running on OpenRouter — so the feed won't go dark, but you also won't
+> notice unless you check `dispatch.log`. Set a calendar reminder to
+> regenerate the key.
+
+### 3. (Optional) Override the model chains via variables
 
 Go to: **Settings → Secrets and variables → Actions → Variables**
 
-| Variable name      | Value (example)                                   |
-|--------------------|---------------------------------------------------|
-| `OPENROUTER_MODEL` | `meta-llama/llama-3.1-8b-instruct:free` (default) |
+| Variable name      | Effect                                                        |
+|--------------------|---------------------------------------------------------------|
+| `NVIDIA_MODELS`    | Comma-separated NVIDIA chain, replaces the built-in default   |
+| `OPENROUTER_MODEL` | Model to try first on the OpenRouter fallback chain           |
 
-Good free alternatives:
-- `mistralai/mistral-7b-instruct:free`
-- `google/gemma-3-12b-it:free`
+Default NVIDIA chain (tried in order — a retired ID 404s and falls through):
+
+1. `nvidia/nemotron-3-super-120b-a12b` — 120B MoE, 1M context, the workhorse
+2. `nvidia/nemotron-3-ultra-550b-a55b` — 550B MoE, slower
+3. `nvidia/nemotron-3-nano-30b-a3b` — fast last resort
+
+Confirm what your key can actually reach:
+
+```bash
+curl -s -H "Authorization: Bearer $NVIDIA_API_KEY" https://integrate.api.nvidia.com/v1/models | grep -o '"id":"[^"]*"'
+```
 
 ### 4. Upload your watchlist
 
@@ -76,12 +100,17 @@ git push
 
 ## Rate limits
 
-| Limit                  | Value           | Impact                                    |
-|------------------------|-----------------|-------------------------------------------|
-| OpenRouter free req/min| 20              | 4s sleep between calls keeps you at ~15   |
-| OpenRouter free req/day| 200             | 3,000 filings/month = ~100/day ✅         |
-| GitHub Actions (public)| Unlimited       | No concern                                |
-| GitHub Actions (private)| 2,000 min/mo  | 100 filings × 7 min/run = ~700 min/mo ✅  |
+Sleep between calls is chosen per provider, based on which one actually
+served the filing.
+
+| Limit                    | Value        | Impact                                     |
+|--------------------------|--------------|--------------------------------------------|
+| NVIDIA NIM free req/min  | ~40/model    | 2s sleep keeps you at ~30 — best effort, not a guarantee |
+| NVIDIA NIM free req/day  | none published | No daily ceiling to plan around ✅       |
+| OpenRouter free req/min  | 20           | 4s sleep keeps you at ~15                  |
+| OpenRouter free req/day  | 200          | Fallback only, so rarely approached        |
+| GitHub Actions (public)  | Unlimited    | No concern                                 |
+| GitHub Actions (private) | 2,000 min/mo | 100 filings × 7 min/run = ~700 min/mo ✅   |
 
 ## Monitoring
 
@@ -97,5 +126,5 @@ git push
 python edgar_poller.py
 
 # Dispatcher (reads whatever is in filings-inbox/):
-OPENROUTER_API_KEY=sk-or-v1-... DISCORD_WEBHOOK=https://... python openrouter_dispatch.py
+NVIDIA_API_KEY=nvapi-... DISCORD_WEBHOOK=https://... python openrouter_dispatch.py
 ```
