@@ -5,12 +5,17 @@ trading windows, matches filings against your watchlist, calls an LLM for a
 fixed-income-analyst summary, and posts to Discord.
 
 **Coverage:** one long-running job per window polls every 15 seconds with no
-gaps — Sofia 11:00–16:00 and 23:00–03:00, Mon–Fri. Windows are evaluated in
-Sofia local time, so the EEST/EET switch needs no maintenance.
+gaps. Windows are evaluated in Sofia local time, so the EEST/EET switch needs
+no maintenance.
 
-> Sofia 11:00 is 04:00 ET and **EDGAR only accepts filings 06:00–22:00 ET**
-> (Sofia 13:00–05:00), so the day window's first two hours are structurally
-> empty. Shifting it to 13:00–18:00 Sofia would make them productive.
+| Window | Sofia | ET | Why |
+|---|---|---|---|
+| Day | 13:00 – 18:00 Mon–Fri | 06:00 – 11:00 | Opens on EDGAR's first filing minute |
+| Night | 23:00 – 03:00 Mon–Fri eve | 16:00 – 20:00 | US after-hours 8-K flow |
+
+Both sit entirely inside EDGAR's filing hours (06:00–22:00 ET), so no cycle is
+wasted. The day window was 11:00–16:00 until Aug 2026, which spent its first
+two hours polling a system that wasn't accepting filings yet.
 
 The LLM is **NVIDIA Nemotron 3** via NVIDIA NIM (free, ~40 req/min, no daily
 cap), with **OpenRouter free models as an automatic fallback**.

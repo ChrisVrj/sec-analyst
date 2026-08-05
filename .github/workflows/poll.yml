@@ -33,14 +33,19 @@ name: EDGAR SEC Poller
 #
 # TRADING WINDOWS (Sofia local — tzdata handles EEST/EET, nothing to edit
 # at the DST switch):
-#   Day   : 11:00 – 16:00   Mon–Fri
-#   Night : 23:00 – 03:00   Mon–Fri evenings (runs into the next calendar day)
+#   Day   : 13:00 – 18:00   Mon–Fri   = 06:00 – 11:00 ET
+#   Night : 23:00 – 03:00   Mon–Fri evenings = 16:00 – 20:00 ET
+#                                     (runs into the next calendar day)
 #
-# ⚠ Sofia 11:00 = 04:00 ET, but EDGAR only accepts filings 06:00–22:00 ET
-#   (= Sofia 13:00–05:00). The day window's first ~2 hours are therefore
-#   structurally empty: edgar_is_open() short-circuits each cycle and the
-#   loop just idles. Nothing is broken. Moving the day window to 13:00–18:00
-#   Sofia would convert those two dead hours into live coverage.
+# Both windows sit entirely inside EDGAR's filing hours (06:00–22:00 ET), so
+# no cycle is wasted. The day window opens at 13:00 Sofia precisely because
+# that is 06:00 ET — EDGAR's first filing minute — in both aligned DST
+# regimes. It was 11:00–16:00 until Aug 2026, which spent its first two hours
+# polling a system that was not yet accepting filings.
+#
+# During the 2–3 weeks each spring/autumn when US and EU clocks are out of
+# step, Sofia 13:00 lands on 07:00 ET instead of 06:00 — still live, just an
+# hour later. Not worth compensating for.
 #
 # COST: public repo = unlimited Actions minutes. ~9h/weekday of runtime is
 # free. SEC sees ~1 feed request per 15s (0.07 req/s against their 10 req/s
@@ -83,10 +88,10 @@ jobs:
           esac
 
           # Window bounds in Sofia minutes-past-midnight.
-          DAY_START=660     # 11:00
-          DAY_END=960       # 16:00
-          NIGHT_START=1380  # 23:00
-          NIGHT_END=180     # 03:00 the following day
+          DAY_START=780     # 13:00 Sofia = 06:00 ET, EDGAR's first filing minute
+          DAY_END=1080      # 18:00 Sofia = 11:00 ET
+          NIGHT_START=1380  # 23:00 Sofia = 16:00 ET
+          NIGHT_END=180     # 03:00 Sofia = 20:00 ET, the following day
 
           PROCEED=false
           WINDOW="none"
@@ -100,7 +105,7 @@ jobs:
             END_MIN=$(( SOFIA_MIN + 10 ))
 
           elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -ge "$DAY_START" ] && [ "$SOFIA_MIN" -lt "$DAY_END" ]; then
-            WINDOW="day 11:00-16:00"
+            WINDOW="day 13:00-18:00"
             PROCEED=true
             END_MIN=$DAY_END
 

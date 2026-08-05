@@ -157,12 +157,14 @@ Chris is based in **Sofia, Bulgaria**. Windows are defined and evaluated in **So
 
 | Window | Sofia local | ET equivalent | Notes |
 |---|---|---|---|
-| Day | 11:00 – 16:00, Mon–Fri | 04:00 – 09:00 ET | See the dead-hours warning below |
-| Night | 23:00 – 03:00, Mon–Fri evenings | 16:00 – 20:00 ET | Fully inside EDGAR hours; this is the after-hours 8-K window |
+| Day | 13:00 – 18:00, Mon–Fri | 06:00 – 11:00 ET | Opens on EDGAR's first filing minute |
+| Night | 23:00 – 03:00, Mon–Fri evenings | 16:00 – 20:00 ET | US after-hours 8-K flow |
 
 The night window deliberately spans midnight and is valid **Tue–Sat** for its 00:00–03:00 half, because that half belongs to the *preceding* weekday's evening. Saturday 00:00–03:00 is Friday's US after-hours session (wanted); Monday 00:00–03:00 would be Sunday's (not wanted, and excluded).
 
-**⚠️ The day window's first ~2 hours are structurally dead.** Sofia 11:00 = 04:00 ET, but **EDGAR only accepts filings 06:00–22:00 ET (= Sofia 13:00–05:00)**. So from 11:00–13:00 Sofia there are no filings in existence to fetch; `edgar_is_open()` short-circuits every cycle and the loop idles. Nothing is broken and it costs nothing (public repo minutes are free), but **moving the day window to 13:00–18:00 Sofia would convert two dead hours into two live ones** — Chris has been told this and kept 11:00–16:00. Do not "fix" it unilaterally.
+**Why the day window starts at 13:00 and not earlier.** EDGAR only accepts filings **06:00–22:00 ET**, and Sofia 13:00 *is* 06:00 ET in both aligned DST regimes — the earliest minute at which a filing can exist. The window was 11:00–16:00 until Aug 2026, which spent its first two hours (Sofia 11:00–13:00 = 04:00–06:00 ET) polling a system that wasn't accepting filings: `edgar_is_open()` short-circuited every cycle and the loop idled. Moving to 13:00–18:00 kept the same 5-hour runtime but made all of it productive — **35 → 45 productive hours/week for identical cost**. Do not move the start earlier; there is nothing there to find.
+
+During the 2–3 weeks each spring/autumn when US and EU clocks are out of step, Sofia 13:00 lands on 07:00 ET rather than 06:00 — still live, just an hour into the day. Not worth compensating for.
 
 **DST is no longer a manual step.** All window arithmetic happens in Sofia local time via the runner's tzdata, so the EEST/EET switch needs no edits. A sanity check asserts the offset is `+0300` or `+0200` and emits a GitHub `::warning::` otherwise — if tzdata ever vanished from the runner image, `TZ=` silently yields UTC and every boundary would shift 2–3 hours, which is exactly the kind of silent breakage this project keeps getting bitten by.
 
@@ -265,7 +267,7 @@ If asked to revise this prompt again, **read the actual current `SYSTEM_PROMPT` 
 - **Discord channel:** `#sec-filings`
 - **SEC contact email (in User-Agent):** `chrisdoesdocu@gmail.com`
 - **LLM provider:** NVIDIA NIM / Nemotron 3 (primary, free tier), OpenRouter free models (automatic fallback)
-- **Trading windows (Sofia local):** 11:00–16:00 and 23:00–03:00, Mon–Fri. Continuous polling every 15s for the whole window, one long job per window.
+- **Trading windows (Sofia local):** 13:00–18:00 and 23:00–03:00, Mon–Fri (= 06:00–11:00 and 16:00–20:00 ET). Continuous polling every 15s for the whole window, one long job per window.
 - **Core files:** `edgar_poller.py` (fetch+extract), `prefilter.py` (noise filter), `openrouter_dispatch.py` (summarize+post), `cik_map.json` (watchlist), `.github/workflows/poll.yml` (orchestration/schedule)
 - **State files (must stay cached across Actions runs):** `seen_accessions.json`, `dispatched_accessions.json`
 - **Queue directories:** `filings-inbox/` (pending), `filings-inbox/processed/` (done — prefixed `skip_`/`err_`/`dup_` to indicate why/how it left the queue)
