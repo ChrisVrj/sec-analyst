@@ -1,8 +1,16 @@
 # sec-poller
 
-GitHub Actions–based SEC filing monitor. Polls EDGAR during your trading
-windows, matches filings against your watchlist, calls an LLM for a
+GitHub Actions–based SEC filing monitor. Polls EDGAR continuously during your
+trading windows, matches filings against your watchlist, calls an LLM for a
 fixed-income-analyst summary, and posts to Discord.
+
+**Coverage:** one long-running job per window polls every 15 seconds with no
+gaps — Sofia 11:00–16:00 and 23:00–03:00, Mon–Fri. Windows are evaluated in
+Sofia local time, so the EEST/EET switch needs no maintenance.
+
+> Sofia 11:00 is 04:00 ET and **EDGAR only accepts filings 06:00–22:00 ET**
+> (Sofia 13:00–05:00), so the day window's first two hours are structurally
+> empty. Shifting it to 13:00–18:00 Sofia would make them productive.
 
 The LLM is **NVIDIA Nemotron 3** via NVIDIA NIM (free, ~40 req/min, no daily
 cap), with **OpenRouter free models as an automatic fallback**.
@@ -105,6 +113,7 @@ served the filing.
 
 | Limit                    | Value        | Impact                                     |
 |--------------------------|--------------|--------------------------------------------|
+| EDGAR fair-access        | 10 req/s     | 15s poll = 0.07 req/s ✅                    |
 | NVIDIA NIM free req/min  | ~40/model    | 2s sleep keeps you at ~30 — best effort, not a guarantee |
 | NVIDIA NIM free req/day  | none published | No daily ceiling to plan around ✅       |
 | OpenRouter free req/min  | 20           | 4s sleep keeps you at ~15                  |

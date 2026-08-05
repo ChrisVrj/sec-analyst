@@ -153,16 +153,18 @@ Current structure:
 
 ## 4. Trading windows / schedule (current target)
 
-Chris is based in **Sofia, Bulgaria**. The two windows he wants covered, in **Sofia local time**:
+Chris is based in **Sofia, Bulgaria**. Windows are defined and evaluated in **Sofia local time** (Aug 2026 rewrite — previously UTC minute constants):
 
-| Window | Sofia local time | UTC (EEST, summer, UTC+3) | UTC (EET, winter, UTC+2) |
+| Window | Sofia local | ET equivalent | Notes |
 |---|---|---|---|
-| Window 1 | 11:00 AM – 4:30 PM | 08:00 – 13:30 | 09:00 – 14:30 |
-| Window 2 | 11:00 PM – 1:30 AM (next day) | 20:00 – 22:30 | 21:00 – 23:30 |
+| Day | 11:00 – 16:00, Mon–Fri | 04:00 – 09:00 ET | See the dead-hours warning below |
+| Night | 23:00 – 03:00, Mon–Fri evenings | 16:00 – 20:00 ET | Fully inside EDGAR hours; this is the after-hours 8-K window |
 
-Both windows are Mon–Fri only (EDGAR/markets closed weekends). The bash window-check in `poll.yml` currently hardcodes the **EEST (summer)** boundaries as minutes-since-UTC-midnight: `W1_START=480 W1_END=810 W2_START=1200 W2_END=1350`.
+The night window deliberately spans midnight and is valid **Tue–Sat** for its 00:00–03:00 half, because that half belongs to the *preceding* weekday's evening. Saturday 00:00–03:00 is Friday's US after-hours session (wanted); Monday 00:00–03:00 would be Sunday's (not wanted, and excluded).
 
-**⚠️ Action item baked into the workflow's comments but not yet automated:** when EU clocks change back to EET (last Sunday of October) and forward to EEST (last Sunday of March), these four numbers need to be manually updated by +60 (to EET) or back to the current values (EEST). The file's header comment documents the exact replacement values (`540/870` and `1260/1410` for EET). **This is a manual, easy-to-forget step** — a good candidate for either (a) a calendar reminder, (b) computing DST in the bash script itself based on date instead of hardcoding, or (c) a scheduled Claude task that nags Chris around the DST transition dates. Worth raising as a fix-it item in the new project.
+**⚠️ The day window's first ~2 hours are structurally dead.** Sofia 11:00 = 04:00 ET, but **EDGAR only accepts filings 06:00–22:00 ET (= Sofia 13:00–05:00)**. So from 11:00–13:00 Sofia there are no filings in existence to fetch; `edgar_is_open()` short-circuits every cycle and the loop idles. Nothing is broken and it costs nothing (public repo minutes are free), but **moving the day window to 13:00–18:00 Sofia would convert two dead hours into two live ones** — Chris has been told this and kept 11:00–16:00. Do not "fix" it unilaterally.
+
+**DST is no longer a manual step.** All window arithmetic happens in Sofia local time via the runner's tzdata, so the EEST/EET switch needs no edits. A sanity check asserts the offset is `+0300` or `+0200` and emits a GitHub `::warning::` otherwise — if tzdata ever vanished from the runner image, `TZ=` silently yields UTC and every boundary would shift 2–3 hours, which is exactly the kind of silent breakage this project keeps getting bitten by.
 
 ---
 
@@ -184,7 +186,17 @@ Both windows are Mon–Fri only (EDGAR/markets closed weekends). The bash window
 
 **Root cause:** GitHub silently throttles/deprioritizes `schedule:`-triggered workflow runs on repositories GitHub's scheduler considers low-activity. This is undocumented behavior (GitHub's docs only officially admit to "up to 15 minutes" of delay under high platform load), but it's a widely-reported community issue, and it was clearly happening here — narrow multi-entry cron schedules were being skipped wholesale for long stretches.
 
-**Fix that worked:** replace all the narrow cron entries with a **single `*/5 * * * *` entry that fires every 5 minutes, all day, every day** (not just during trading windows). A high-frequency, simple, constantly-firing cron is treated by GitHub's scheduler as "active" and gets honored reliably. The actual "should we do real work right now" decision moved **out of the cron expression and into a bash time-window check inside the job** (the `Check trading window` step described in §3). Outside the windows, the job still fires every 5 minutes but does almost nothing and finishes in seconds — which costs nothing on a public repo's unlimited Actions minutes.
+**Continuous-coverage rewrite (Aug 2026).** The job no longer loops for a fixed ~4 minutes. It now loops **until the current window closes** (up to 5h; GitHub's per-job ceiling is 6h, `timeout-minutes: 320`), polling every **15 seconds**. This removes the ~30s of blindness that used to occur at every run boundary, plus GitHub's scheduling jitter on top of it. Three pieces make it work together:
+
+1. `cron: '*/5 * * * *'` stays — its job is keeping GitHub's scheduler warm (see below), not triggering the actual work.
+2. `concurrency: {group: edgar-poller, cancel-in-progress: false}` — GitHub permits at most one **running** plus one **pending** run per group, and each new trigger replaces the pending one. So the `*/5` ticks during a live window can't double-post, and a replacement run is always parked ready to take over within seconds if the long run dies.
+3. The window step emits `run_seconds` alongside `proceed`; the loop uses it as its deadline.
+
+**Expected and harmless:** while a long run is live, the Actions tab fills with **cancelled runs that never executed a step** (~60 per day window) — that is the pending-slot mechanism working. The run that matters is the single long-lived one.
+
+**Known limitation of long jobs:** `actions/cache` only writes in its post-job step, so `seen_accessions.json` / `dispatched_accessions.json` are persisted once, at window close. If a job is killed mid-window that state is lost — but the blast radius is bounded, because the poller only ever sees EDGAR's last-100-filings feed, so at worst a couple of recent filings get re-posted rather than a whole window's worth.
+
+**Fix that worked (the original throttling bug):** replace all the narrow cron entries with a **single `*/5 * * * *` entry that fires every 5 minutes, all day, every day** (not just during trading windows). A high-frequency, simple, constantly-firing cron is treated by GitHub's scheduler as "active" and gets honored reliably. The actual "should we do real work right now" decision moved **out of the cron expression and into a bash time-window check inside the job** (the `Check trading window` step described in §3). Outside the windows, the job still fires every 5 minutes but does almost nothing and finishes in seconds — which costs nothing on a public repo's unlimited Actions minutes.
 
 **Manual runs bypass the window check (added Aug 2026).** The step's first branch is `if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]` → `PROCEED=true`. Without it, a manual "Run workflow" fired outside a Sofia window skips every step and produces a green, completely inert run — which reads as success but polls nothing and posts nothing, and cost real debugging time at least once. `edgar_poller.py`'s own `edgar_is_open()` (6 AM–10 PM ET, weekdays, non-holiday) remains as a second guard on manual runs, so a manual trigger at 3 AM ET still polls nothing — it just logs "EDGAR is closed right now" instead, which is at least diagnosable.
 
@@ -253,7 +265,7 @@ If asked to revise this prompt again, **read the actual current `SYSTEM_PROMPT` 
 - **Discord channel:** `#sec-filings`
 - **SEC contact email (in User-Agent):** `chrisdoesdocu@gmail.com`
 - **LLM provider:** NVIDIA NIM / Nemotron 3 (primary, free tier), OpenRouter free models (automatic fallback)
-- **Trading windows (Sofia local):** 11:00 AM–4:30 PM and 11:00 PM–1:30 AM, Mon–Fri
+- **Trading windows (Sofia local):** 11:00–16:00 and 23:00–03:00, Mon–Fri. Continuous polling every 15s for the whole window, one long job per window.
 - **Core files:** `edgar_poller.py` (fetch+extract), `prefilter.py` (noise filter), `openrouter_dispatch.py` (summarize+post), `cik_map.json` (watchlist), `.github/workflows/poll.yml` (orchestration/schedule)
 - **State files (must stay cached across Actions runs):** `seen_accessions.json`, `dispatched_accessions.json`
 - **Queue directories:** `filings-inbox/` (pending), `filings-inbox/processed/` (done — prefixed `skip_`/`err_`/`dup_` to indicate why/how it left the queue)

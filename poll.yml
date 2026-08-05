@@ -1,114 +1,144 @@
 name: EDGAR SEC Poller
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WHY */5 * * * * instead of targeted crons?
+# GOAL: continuous coverage during the trading windows — every filing fetched,
+# summarized and posted within seconds, with no gaps to fall through.
 #
-# GitHub throttles scheduled workflows on low-activity repos, causing runs to
-# fire every 1-2 hours instead of every 5 minutes. A single high-frequency
-# cron keeps the workflow "hot" so GitHub honours the cadence reliably.
+# HOW THE THREE PIECES FIT TOGETHER
 #
-# The time-window check is done in bash (step 1). All subsequent steps carry
-# an  if: steps.window.outputs.proceed == 'true'  guard so they are skipped
-# instantly when the job fires outside the Sofia trading windows.
+# 1. cron '*/5 * * * *' — fires every 5 minutes, 24/7.
+#    NOT because we want a run every 5 minutes, but because GitHub throttles
+#    scheduled workflows on repos its scheduler considers low-activity. A
+#    single high-frequency cron keeps the workflow "hot" so the cadence is
+#    honoured. Narrow window-shaped crons were tried and got skipped for
+#    1-2 hours at a stretch. Do not "optimize" this back to targeted crons.
 #
-# Trading windows (Sofia local time):
-#   Window 1 : 11:00 AM – 04:30 PM
-#   Window 2 : 11:00 PM – 01:30 AM (next day)
+# 2. concurrency (cancel-in-progress: false) — GitHub allows at most one
+#    RUNNING plus one PENDING run per group; each new trigger replaces the
+#    pending one. That gives two things for free:
+#      · the */5 ticks during a window can't pile up or double-post
+#      · a pending run is always parked, so if the long run dies the
+#        replacement starts within seconds of the failure, not 5 minutes
 #
-# UTC equivalents (EEST = UTC+3, summer):
-#   Window 1 : 08:00 – 13:30 UTC  →  480 – 810  min
-#   Window 2 : 20:00 – 22:30 UTC  → 1200 – 1350 min
+#    EXPECTED SIDE EFFECT: while a long run is live, each */5 tick replaces
+#    the parked pending run, so the Actions tab fills with "cancelled" runs
+#    that never executed a step — roughly 60 per day window. This is the
+#    mechanism working, not a fault. The run that matters is the single
+#    long-lived one; sort by duration to find it.
 #
-# ⚠ When clocks go back to EET (UTC+2, late Oct – late Mar):
-#   Set W1_START=540 W1_END=870 W2_START=1260 W2_END=1410
+# 3. The job runs ONE LONG LOOP to the end of the current window rather than
+#    a fixed 4 minutes. GitHub's job ceiling is 6h; the longest window is 5h.
+#    This is what removes the inter-run gaps entirely — previously every run
+#    boundary cost ~30s of blindness, plus GitHub's scheduling jitter.
+#
+# TRADING WINDOWS (Sofia local — tzdata handles EEST/EET, nothing to edit
+# at the DST switch):
+#   Day   : 11:00 – 16:00   Mon–Fri
+#   Night : 23:00 – 03:00   Mon–Fri evenings (runs into the next calendar day)
+#
+# ⚠ Sofia 11:00 = 04:00 ET, but EDGAR only accepts filings 06:00–22:00 ET
+#   (= Sofia 13:00–05:00). The day window's first ~2 hours are therefore
+#   structurally empty: edgar_is_open() short-circuits each cycle and the
+#   loop just idles. Nothing is broken. Moving the day window to 13:00–18:00
+#   Sofia would convert those two dead hours into live coverage.
+#
+# COST: public repo = unlimited Actions minutes. ~9h/weekday of runtime is
+# free. SEC sees ~1 feed request per 15s (0.07 req/s against their 10 req/s
+# limit). NVIDIA sees at most 30 req/min against a ~40 req/min free ceiling.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # every 5 min 24/7 — window check below keeps it clean
-  workflow_dispatch:         # manual trigger for testing
+    - cron: '*/5 * * * *'   # keeps the scheduler warm; window check does the real gating
+  workflow_dispatch:         # manual trigger — bypasses the window, capped at 10 min
+
+concurrency:
+  group: edgar-poller
+  cancel-in-progress: false  # never kill a live poller; queue one replacement behind it
 
 jobs:
   poll-and-dispatch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 320     # longest window is 5h; GitHub's hard ceiling is 6h
 
     steps:
-      # ── 1. Check trading window ────────────────────────────────────────────
+      # ── 1. Which window are we in, and how long should this job live? ─────
       - name: Check trading window
         id: window
         run: |
-          HOUR_UTC=$(date -u +%-H)
-          MIN_UTC=$(date -u  +%-M)
-          TIME_UTC=$(( HOUR_UTC * 60 + MIN_UTC ))
-          DOW=$(date -u +%u)   # 1=Mon … 7=Sun
+          # Everything is computed in Sofia local time, so EEST/EET is handled
+          # by tzdata. This replaced four UTC constants that had to be
+          # hand-edited on the last Sunday of March and October.
+          read -r SOFIA_H SOFIA_M SOFIA_DOW <<< "$(TZ=Europe/Sofia date +'%-H %-M %u')"
+          SOFIA_MIN=$(( SOFIA_H * 60 + SOFIA_M ))
+          SOFIA_OFFSET=$(TZ=Europe/Sofia date +%z)
 
-          echo "UTC $(date -u '+%H:%M')  DOW=$DOW  min=$TIME_UTC"
+          echo "Sofia $(TZ=Europe/Sofia date '+%H:%M %a') (UTC$SOFIA_OFFSET)  dow=$SOFIA_DOW  min=$SOFIA_MIN"
+
+          # Guard: if the runner ever loses tzdata, TZ= silently yields UTC and
+          # every window would shift 2-3 hours. Make that loud, not silent.
+          case "$SOFIA_OFFSET" in
+            +0300|+0200) ;;
+            *) echo "::warning title=Sofia timezone lookup failed::Offset '$SOFIA_OFFSET' is neither +0300 nor +0200 — tzdata missing? Window boundaries are unreliable." ;;
+          esac
+
+          # Window bounds in Sofia minutes-past-midnight.
+          DAY_START=660     # 11:00
+          DAY_END=960       # 16:00
+          NIGHT_START=1380  # 23:00
+          NIGHT_END=180     # 03:00 the following day
 
           PROCEED=false
+          WINDOW="none"
+          END_MIN=0
 
-          # Manual runs bypass the window check — otherwise there is no way to
-          # test outside Sofia trading hours, which is exactly when you're
-          # usually sitting down to test. edgar_poller.py's own edgar_is_open()
-          # is still a second guard (it blocks outside 6am-10pm ET).
-          #
-          # NOTE: this sets PROCEED and falls through to the single
-          # $GITHUB_OUTPUT write at the bottom. Do NOT "simplify" this to an
-          # `exit 0` early-return — see AGENTS.md §6: exit codes only end the
-          # current step, later steps run regardless, so the guard would
-          # silently stop working.
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Manual run — bypassing trading-window check."
+            # Manual test: run regardless of the clock, but only briefly — a
+            # manual run must not hold the concurrency slot for five hours.
+            WINDOW="manual"
             PROCEED=true
-          elif [ "$DOW" -lt 6 ]; then
-            # ── Sofia UTC offset, derived from tzdata instead of hardcoded ──
-            # Was: four constants hand-edited twice a year at the EEST/EET
-            # switch (last Sun of Mar / Oct), documented as an easy-to-forget
-            # manual step. The runner has tzdata, so just ask it. Window
-            # semantics are unchanged — this only picks the right constants.
-            SOFIA_OFFSET=$(TZ=Europe/Sofia date +%z)
+            END_MIN=$(( SOFIA_MIN + 10 ))
 
-            case "$SOFIA_OFFSET" in
-              +0300)  # EEST, summer
-                echo "Sofia on EEST (UTC+3)"
-                W1_START=480    # 08:00 UTC = 11:00 Sofia
-                W1_END=810      # 13:30 UTC = 16:30 Sofia
-                W2_START=1200   # 20:00 UTC = 23:00 Sofia
-                W2_END=1350     # 22:30 UTC = 01:30 Sofia (+1)
-                ;;
-              +0200)  # EET, winter
-                echo "Sofia on EET (UTC+2)"
-                W1_START=540    # 09:00 UTC = 11:00 Sofia
-                W1_END=870      # 14:30 UTC = 16:30 Sofia
-                W2_START=1260   # 21:00 UTC = 23:00 Sofia
-                W2_END=1410     # 23:30 UTC = 01:30 Sofia (+1)
-                ;;
-              *)
-                # Only reachable if the runner image loses tzdata. Guessing
-                # here would silently shift both windows by an hour, so make
-                # it shout in the Actions UI rather than quietly misbehave.
-                echo "::warning title=Sofia timezone lookup failed::Got offset '$SOFIA_OFFSET', expected +0300 or +0200. Falling back to EEST constants; windows may be off by an hour."
-                W1_START=480
-                W1_END=810
-                W2_START=1200
-                W2_END=1350
-                ;;
-            esac
+          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -ge "$DAY_START" ] && [ "$SOFIA_MIN" -lt "$DAY_END" ]; then
+            WINDOW="day 11:00-16:00"
+            PROCEED=true
+            END_MIN=$DAY_END
 
-            if   [ "$TIME_UTC" -ge "$W1_START" ] && [ "$TIME_UTC" -lt "$W1_END" ]; then
-              echo "Window 1 — proceeding."
-              PROCEED=true
-            elif [ "$TIME_UTC" -ge "$W2_START" ] && [ "$TIME_UTC" -lt "$W2_END" ]; then
-              echo "Window 2 — proceeding."
-              PROCEED=true
-            else
-              echo "Outside windows — skipping."
-            fi
+          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -ge "$NIGHT_START" ]; then
+            # Evening half of the night window. Run straight through midnight
+            # to 03:00 so the session is covered by a single job: 1440 + 180.
+            WINDOW="night 23:00-03:00"
+            PROCEED=true
+            END_MIN=$(( 1440 + NIGHT_END ))
+
+          elif [ "$SOFIA_DOW" -ge 2 ] && [ "$SOFIA_DOW" -le 6 ] && [ "$SOFIA_MIN" -lt "$NIGHT_END" ]; then
+            # After-midnight half. Valid Tue–Sat because it belongs to the
+            # PRECEDING weekday's evening — Sat 00:00-03:00 is Friday's US
+            # after-hours session and is wanted; Mon 00:00-03:00 is Sunday's
+            # and is not.
+            WINDOW="night 23:00-03:00 (past midnight)"
+            PROCEED=true
+            END_MIN=$NIGHT_END
+
           else
-            echo "Weekend — skipping."
+            echo "Outside trading windows — skipping."
           fi
 
-          echo "proceed=$PROCEED" >> "$GITHUB_OUTPUT"
+          RUN_SECONDS=0
+          if [ "$PROCEED" = "true" ]; then
+            RUN_SECONDS=$(( (END_MIN - SOFIA_MIN) * 60 ))
+            # Clamp: never negative (clock races at a boundary), never beyond
+            # the job timeout.
+            [ "$RUN_SECONDS" -lt 60 ] && RUN_SECONDS=60
+            [ "$RUN_SECONDS" -gt 18600 ] && RUN_SECONDS=18600
+            echo "Window: $WINDOW — looping for ${RUN_SECONDS}s (until Sofia $(( END_MIN / 60 % 24 )):$(printf '%02d' $(( END_MIN % 60 ))))"
+          fi
+
+          {
+            echo "proceed=$PROCEED"
+            echo "run_seconds=$RUN_SECONDS"
+            echo "window=$WINDOW"
+          } >> "$GITHUB_OUTPUT"
 
       # ── 2. Checkout ────────────────────────────────────────────────────────
       - name: Checkout
@@ -123,6 +153,11 @@ jobs:
           python-version: '3.11'
 
       # ── 4. Restore caches ──────────────────────────────────────────────────
+      #  NOTE: actions/cache only writes in its post-job step, so with a
+      #  window-length job this state is persisted once, at the end. If the job
+      #  is killed mid-window the state is lost — but the blast radius is
+      #  bounded, because the poller only ever sees EDGAR's last-100-filings
+      #  feed, so at worst a couple of recent filings get re-posted.
       - name: Restore seen accessions cache
         if: steps.window.outputs.proceed == 'true'
         uses: actions/cache@v4
@@ -141,37 +176,40 @@ jobs:
           restore-keys: |
             dispatched-accessions-
 
-      # ── 5. Poll + dispatch loop (runs for ~4 min, polls every 30 s) ────────
+      # ── 5. Poll + dispatch, continuously, until the window closes ──────────
       - name: Poll and dispatch loop
         if: steps.window.outputs.proceed == 'true'
         run: |
-          END_TIME=$(( $(date +%s) + 240 ))
+          POLL_SECONDS=15
+          END_TIME=$(( $(date +%s) + ${{ steps.window.outputs.run_seconds }} ))
           POLL=0
+          POSTED=0
 
-          while [ $(date +%s) -lt $END_TIME ]; do
+          echo "Window '${{ steps.window.outputs.window }}' — polling every ${POLL_SECONDS}s until $(date -u -d "@$END_TIME" '+%H:%M:%S UTC')"
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
             POLL=$(( POLL + 1 ))
-            echo "──── Poll #$POLL at $(date -u '+%H:%M:%S UTC') ────"
 
             python edgar_poller.py --once
 
             COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
-            echo "Inbox: $COUNT filing(s)"
-
-            if [ "$COUNT" -gt "0" ]; then
+            if [ "$COUNT" -gt 0 ]; then
+              echo "──── Poll #$POLL: $COUNT filing(s) queued, dispatching ────"
               python openrouter_dispatch.py
+              POSTED=$(( POSTED + COUNT ))
             fi
 
             REMAINING=$(( END_TIME - $(date +%s) ))
-            if [ $REMAINING -gt 30 ]; then
-              sleep 30
-            elif [ $REMAINING -gt 5 ]; then
-              sleep 5
-            else
+            if [ "$REMAINING" -le 0 ]; then
               break
+            elif [ "$REMAINING" -gt "$POLL_SECONDS" ]; then
+              sleep "$POLL_SECONDS"
+            else
+              sleep "$REMAINING"
             fi
           done
 
-          echo "Loop complete after $POLL poll(s)."
+          echo "Window closed after $POLL poll(s); $POSTED filing(s) entered the dispatcher."
         env:
           GITHUB_WORKSPACE:   ${{ github.workspace }}
           DISCORD_WEBHOOK:    ${{ secrets.DISCORD_WEBHOOK }}
