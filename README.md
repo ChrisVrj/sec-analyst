@@ -112,6 +112,16 @@ served the filing.
 | GitHub Actions (public)  | Unlimited    | No concern                                 |
 | GitHub Actions (private) | 2,000 min/mo | 100 filings × 7 min/run = ~700 min/mo ✅   |
 
+## Tests
+
+```bash
+python test_pipeline.py
+```
+
+Offline, no secrets, no network. Runs automatically via `.github/workflows/test.yml`
+on any push touching a `.py` file. Every case corresponds to a bug that actually
+reached Discord — **add one whenever a bad post gets through.**
+
 ## Monitoring
 
 - **Logs**: Each run uploads `edgar_poller.log` and `dispatch.log` as

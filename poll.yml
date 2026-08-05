@@ -61,11 +61,39 @@ jobs:
             echo "Manual run — bypassing trading-window check."
             PROCEED=true
           elif [ "$DOW" -lt 6 ]; then
-            # ── EEST (UTC+3) ──────────────────────────────────────────────
-            W1_START=480    # 08:00 UTC = 11:00 Sofia
-            W1_END=810      # 13:30 UTC = 16:30 Sofia
-            W2_START=1200   # 20:00 UTC = 23:00 Sofia
-            W2_END=1350     # 22:30 UTC = 01:30 Sofia (+1)
+            # ── Sofia UTC offset, derived from tzdata instead of hardcoded ──
+            # Was: four constants hand-edited twice a year at the EEST/EET
+            # switch (last Sun of Mar / Oct), documented as an easy-to-forget
+            # manual step. The runner has tzdata, so just ask it. Window
+            # semantics are unchanged — this only picks the right constants.
+            SOFIA_OFFSET=$(TZ=Europe/Sofia date +%z)
+
+            case "$SOFIA_OFFSET" in
+              +0300)  # EEST, summer
+                echo "Sofia on EEST (UTC+3)"
+                W1_START=480    # 08:00 UTC = 11:00 Sofia
+                W1_END=810      # 13:30 UTC = 16:30 Sofia
+                W2_START=1200   # 20:00 UTC = 23:00 Sofia
+                W2_END=1350     # 22:30 UTC = 01:30 Sofia (+1)
+                ;;
+              +0200)  # EET, winter
+                echo "Sofia on EET (UTC+2)"
+                W1_START=540    # 09:00 UTC = 11:00 Sofia
+                W1_END=870      # 14:30 UTC = 16:30 Sofia
+                W2_START=1260   # 21:00 UTC = 23:00 Sofia
+                W2_END=1410     # 23:30 UTC = 01:30 Sofia (+1)
+                ;;
+              *)
+                # Only reachable if the runner image loses tzdata. Guessing
+                # here would silently shift both windows by an hour, so make
+                # it shout in the Actions UI rather than quietly misbehave.
+                echo "::warning title=Sofia timezone lookup failed::Got offset '$SOFIA_OFFSET', expected +0300 or +0200. Falling back to EEST constants; windows may be off by an hour."
+                W1_START=480
+                W1_END=810
+                W2_START=1200
+                W2_END=1350
+                ;;
+            esac
 
             if   [ "$TIME_UTC" -ge "$W1_START" ] && [ "$TIME_UTC" -lt "$W1_END" ]; then
               echo "Window 1 — proceeding."

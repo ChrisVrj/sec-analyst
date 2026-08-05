@@ -146,6 +146,8 @@ DISPATCHED_FILE = BASE_DIR / "dispatched_accessions.json"
 MAX_TOKENS          = 900
 MAX_TEXT_CHARS      = 400_000
 MAX_DISCORD_CHARS   = 1_900
+MAX_FIELD_LINE      = 240    # a "**Label:** value" line
+MAX_PROSE_LINE      = 420    # an OTHER-template paragraph
 DEFAULT_SLEEP       = 4
 MAX_RETRIES         = 1
 RETRY_DELAY         = 3
@@ -196,7 +198,16 @@ For tender or exchange offer on a publicly traded security:
 
 [BODY — pick ONE section by filing type. Use "n/d" for figures the filing doesn't disclose. Drop lines that don't apply.]
 
+== HOW TO WRITE BODY FIELDS (read before choosing a section) ==
+- Every **Field:** line is a SHORT EXTRACTED VALUE — a number, a date, a name, a ticker. Target under 15 words. Never longer than one line.
+- NEVER copy sentences out of the filing into the body. If the value you want isn't a clean figure, write "n/d" and move on. A field padded with prospectus boilerplate is worse than no field.
+- If a section's fields are almost all "n/d", you picked the wrong section — use OTHER instead.
+
 — CEF / BDC NAV (N-CSR, N-CSRS, N-PORT, N-2, 10-Q, 10-K, 8-K with NAV) —
+USE THIS SECTION ONLY IF BOTH ARE TRUE:
+  (a) the issuer is a closed-end fund, BDC, or registered investment company — its name usually contains Fund / Trust / Income / Capital Corp, or the form is an N- form; AND
+  (b) the filing actually states a net asset value per share.
+An operating company (a manufacturer, bank, REIT, utility, insurer) has NO NAV. If you are looking at one, use a different section — inventing a NAV for an operating company is a serious error.
 **NAV:** $X.XX per share (prior $X.XX, ±X.X%)
 **Market price:** $X.XX (X.X% discount / premium)
 **Total net assets:** $X.XXbn (prior $X.XXbn)
@@ -247,18 +258,17 @@ For tender or exchange offer on a publicly traded security:
 **Closing conditions / expected close:** ...
 
 — OTHER —
-2 to 4 sentences of plain prose covering the material content.
+2 to 4 sentences of plain prose, in your own words, covering the material content. This is the correct fallback whenever no other section fits — including for operating companies, and for any filing whose figures you cannot cleanly extract.
 
-Always end with:
-Link: <EDGAR URL>
-Accession: XXXXXXXXXX-XX-XXXXXX
+Do NOT write a "Link:" or "Accession:" line. The system appends the verified EDGAR URL and accession number automatically after your text. Anything you write there is discarded.
 
 == CONSTRAINTS ==
-- Total message ≤ 1800 characters
+- Total message ≤ 1600 characters. Going over gets your ending cut off, so stop early rather than padding.
 - Discord markdown: ## for highlight headers, ** for bold, > for blockquote
-- Verbatim quotes (with double quotes inside a > blockquote) ONLY inside the highlight block
-- The body uses paraphrase + key-value lines, NO blockquotes
-- Never invent figures, dates, or ticker symbols. If a field is not disclosed, write "n/d" or drop the line entirely
+- Verbatim quotes (with double quotes inside a > blockquote) ONLY inside the highlight block, and at most 2 sentences long
+- The body uses paraphrase + key-value lines, NO blockquotes, NO copied filing sentences
+- Never invent figures, dates, ticker symbols, or NAVs. If a field is not disclosed, write "n/d" or drop the line entirely
+- Ignore boilerplate: risk factors, tax discussion, "past performance is not an indication of future results", distribution-rate footnotes, and legal disclaimers are never worth reporting
 - Include the highlight block ONLY when the trigger event is literally stated in the filing — when in doubt, omit
 - For CEFs and BDCs, prior-period comparisons matter — include them when disclosed
 
@@ -536,6 +546,80 @@ def call_llm(filing: dict) -> tuple[str, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Message assembly
+#
+# The Link/Accession footer is built from the filing payload, NOT from the
+# model. Two reasons, both observed in production:
+#   1. A blind summary[:1900] truncation cut a long N-CSR/A summary off
+#      mid-word and took the footer with it — leaving a post with no way to
+#      reach the filing, which is the one thing the post must always carry.
+#   2. A model-written URL can be wrong. The one in the payload came from
+#      EDGAR itself and is correct by construction.
+# So: strip any footer the model wrote, fit the body to the remaining budget,
+# then append the real footer last.
+# ---------------------------------------------------------------------------
+
+_MODEL_FOOTER_RE = re.compile(r"^[ \t]*(link|accession)[ \t]*:.*$", re.IGNORECASE | re.MULTILINE)
+
+
+def build_footer(filing: dict) -> str:
+    """Verified EDGAR link + accession. Angle brackets suppress Discord's
+    link-preview embed, which keeps #sec-filings scannable."""
+    lines = []
+    url = (filing.get("filing_url", "") or "").strip()
+    acc = (filing.get("accession", "") or "").strip()
+    if url:
+        lines.append(f"Link: <{url}>")
+    if acc:
+        lines.append(f"Accession: {acc}")
+    return "\n".join(lines)
+
+
+def trim_long_lines(body: str) -> str:
+    """Cap runaway lines.
+
+    A CEF N-CSR/A once produced a single 1,400-char "field" that was raw
+    prospectus boilerplate copied out of the filing — it consumed the whole
+    Discord budget on its own. Blockquote lines are left alone: those are the
+    verbatim highlight quotes, which are supposed to be long.
+    """
+    out = []
+    for line in body.split("\n"):
+        if line.lstrip().startswith(">"):
+            out.append(line)
+            continue
+        limit = MAX_FIELD_LINE if line.lstrip().startswith("**") else MAX_PROSE_LINE
+        if len(line) > limit:
+            line = line[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-") + " …"
+        out.append(line)
+    return "\n".join(out)
+
+
+def fit_to_budget(body: str, budget: int) -> str:
+    """Truncate on a line boundary where possible, else a word boundary —
+    never mid-word, which is how the BGT post ended on 'Does not reflect deri'."""
+    if len(body) <= budget:
+        return body
+    cut = body[:budget]
+    nl = cut.rfind("\n")
+    if nl > budget * 0.6:          # a clean line break reasonably near the end
+        return cut[:nl].rstrip() + "\n…"
+    return cut.rsplit(" ", 1)[0].rstrip(" ,;:-") + " …"
+
+
+def finalize_message(summary: str, filing: dict) -> str:
+    body = _MODEL_FOOTER_RE.sub("", summary).strip()
+    body = trim_long_lines(body)
+
+    footer = build_footer(filing)
+    if not footer:
+        return fit_to_budget(body, MAX_DISCORD_CHARS)
+
+    budget = MAX_DISCORD_CHARS - len(footer) - 2   # 2 for the joining newlines
+    return f"{fit_to_budget(body, budget)}\n\n{footer}"
+
+
+# ---------------------------------------------------------------------------
 # Move to processed
 # ---------------------------------------------------------------------------
 
@@ -598,11 +682,10 @@ def dispatch(filing_path: Path) -> int:
         move_to_processed(filing_path, prefix="err_")
         return DEFAULT_SLEEP  # attempts were spent; rate-limit anyway
 
-    if len(summary) > MAX_DISCORD_CHARS:
-        summary = summary[:MAX_DISCORD_CHARS]
+    message = finalize_message(summary, filing)
 
-    send_discord(summary, label=f"{ticker} / {accession} via {provider['name']}")
-    log.info(f"Summary preview: {summary[:300]}")
+    send_discord(message, label=f"{ticker} / {accession} via {provider['name']}")
+    log.info(f"Summary preview: {message[:300]}")
     move_to_processed(filing_path)
     return provider["sleep"]
 

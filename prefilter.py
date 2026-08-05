@@ -73,6 +73,17 @@ STRUCTURED_NOTE_SIGNALS: list[str] = [
     "worst performing underlying",
     "linked to the lowest",
     "step-up callable",
+    # Added Aug 2026 after an RBC Nasdaq-100 buffer note (0000950103-26-011945)
+    # reached Discord. None of the signals above appear in it — its payoff
+    # vocabulary is "participation rate" / "buffer" / "underlier" instead.
+    "participation rate",
+    "upside participation",
+    "buffer amount",
+    "buffer level",
+    "structured note",
+    "underlier",              # near-universal in payoff-linked notes, ~never in preferreds
+    "initial underlier level",
+    "final underlier level",
 ]
 
 # ---------------------------------------------------------------------------
@@ -95,24 +106,35 @@ UNLISTED_SIGNALS: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Listed signals — explicit listing language. If any of these appear, KEEP
-# the filing even if other unlisted/structured signals also appear.
+# Listed signals — explicit statements that THIS offering will list on a US
+# exchange. Overrides STRUCTURED_NOTE_SIGNALS (a genuine exchange-listed baby
+# bond can share payoff vocabulary with a structured note), but NOT
+# UNLISTED_SIGNALS — see is_unlisted_offering() for the precedence rule.
+#
+# ⚠ Every entry must describe the SECURITY BEING OFFERED, not merely mention
+# an exchange. Bare "listed on the nasdaq" was removed Aug 2026: it matched
+# the Nasdaq-100 Index's own definition ("100 of the largest non-financial
+# companies listed on The Nasdaq Stock Market") inside an RBC structured note
+# and forced a keep on a filing that twice said it would NOT be listed.
+# Prefer phrasings containing "apply to list" / "approved for listing" /
+# "under the symbol", which have no benign index-description reading.
 # ---------------------------------------------------------------------------
 LISTED_SIGNALS: list[str] = [
     "nyse:",
     "nasdaq:",
-    "listed on the new york stock exchange",
-    "listed on the nasdaq",
-    "expected to be listed on the new york",
-    "expected to be listed on the nasdaq",
     "application has been made to list",
     "we have applied to list",
     "we intend to apply to list",
     "intend to apply to list the",
     "approved for listing on the new york",
     "approved for listing on the nasdaq",
+    "approved for listing on the nyse",
+    "expected to be listed on the new york",
+    "expected to be listed on the nasdaq",
+    "will be listed on the new york stock exchange",
+    "will be listed on the nasdaq",
     "trade on the new york stock exchange under the symbol",
-    "trade on the nasdaq",
+    "trade on the nasdaq stock market under the symbol",
 ]
 
 OWNERSHIP_FORMS: set[str] = {"3", "4", "5", "3/A", "4/A", "5/A"}
@@ -140,23 +162,38 @@ def is_activist_filer(filing: dict) -> bool:
 
 def is_unlisted_offering(filing: dict) -> tuple[bool, str]:
     """
-    Returns (skip, reason). True means the offering is unlisted retail/wholesale
-    product not relevant to a public-securities trader.
+    Returns (skip, reason). True means the offering is an unlisted
+    retail/wholesale product not relevant to a public-securities trader.
+
+    PRECEDENCE (order matters — this was the Aug 2026 bug):
+
+      1. An explicit UNLISTED_SIGNAL wins outright. "The notes will not be
+         listed on any securities exchange" is an unambiguous statement about
+         the security being offered; there is no benign reading of it. It is
+         NOT overridable by a listing phrase, because listing phrases turned
+         out to be the fragile ones.
+      2. Otherwise, structured-note vocabulary drops the filing — unless a
+         LISTED_SIGNAL says this particular offering will list, which is the
+         escape hatch for exchange-traded baby bonds that happen to share
+         payoff vocabulary.
+
+    The previous order checked LISTED_SIGNALS first and returned early, so one
+    loose phrase matching an index description ("...companies listed on The
+    Nasdaq Stock Market") beat two explicit "will not be listed" statements
+    and pushed an RBC buffer note to Discord. Do not reinstate that ordering.
     """
     text = (filing.get("filing_text", "") or "").lower()
 
-    # If the filing explicitly says it will be listed on a US exchange, keep it
-    # regardless of any other signals.
-    if any(s in text for s in LISTED_SIGNALS):
-        return False, ""
+    unlisted = next((s for s in UNLISTED_SIGNALS if s in text), None)
+    if unlisted:
+        return True, f"unlisted offering ({unlisted!r})"
 
-    # Strong: structured-note language → drop.
-    if any(s in text for s in STRUCTURED_NOTE_SIGNALS):
-        return True, "structured note (unlisted)"
-
-    # Explicit unlisted statement → drop (catches bank senior notes too).
-    if any(s in text for s in UNLISTED_SIGNALS):
-        return True, "unlisted offering"
+    structured = next((s for s in STRUCTURED_NOTE_SIGNALS if s in text), None)
+    if structured:
+        listed = next((s for s in LISTED_SIGNALS if s in text), None)
+        if listed:
+            return False, ""
+        return True, f"structured note ({structured!r})"
 
     return False, ""
 

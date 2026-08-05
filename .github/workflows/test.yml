@@ -1,0 +1,36 @@
+name: Tests
+
+# Runs the offline regression suite on every push/PR that touches the
+# pipeline. No secrets, no network, no EDGAR calls — finishes in seconds.
+#
+# The point: this project's failure mode is silence. A broken prefilter or a
+# mangled Discord message looks exactly like "nothing was filed today", so
+# regressions used to surface days later. This makes them fail loudly on push
+# instead.
+
+on:
+  push:
+    paths:
+      - '**.py'
+      - '.github/workflows/test.yml'
+  pull_request:
+    paths:
+      - '**.py'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile all modules
+        run: python -m compileall -q edgar_poller.py prefilter.py openrouter_dispatch.py test_pipeline.py
+
+      - name: Regression suite
+        run: python test_pipeline.py
