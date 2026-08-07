@@ -64,7 +64,7 @@ concurrency:
 jobs:
   poll-and-dispatch:
     runs-on: ubuntu-latest
-    timeout-minutes: 320     # longest window is 5h; GitHub's hard ceiling is 6h
+    timeout-minutes: 350     # 5h45m of wait+polling, plus setup; ceiling is 6h
 
     steps:
       # ── 1. Which window are we in, and how long should this job live? ─────
@@ -93,9 +93,16 @@ jobs:
           NIGHT_START=1380  # 23:00 Sofia = 16:00 ET
           NIGHT_END=180     # 03:00 Sofia = 20:00 ET, the following day
 
+          # Budget. A job may run 6h; leave headroom for checkout/setup/upload.
+          MAX_WAIT_SECONDS=7200      # 2h — longest we'll idle waiting to open
+          MAX_TOTAL_SECONDS=20700    # 5h45m of wait + polling combined
+          MIN_USEFUL_SECONDS=1800    # don't bother waiting for <30 min of polling
+
           PROCEED=false
           WINDOW="none"
           END_MIN=0
+          WAIT_MIN=0
+          WIN_LEN_MIN=0
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             # Manual test: run regardless of the clock, but only briefly — a
@@ -125,22 +132,66 @@ jobs:
             PROCEED=true
             END_MIN=$NIGHT_END
 
+          # ── Pre-window arming ────────────────────────────────────────────
+          # GitHub does NOT honour the */5 cron: measured trigger cadence is
+          # 1.5-3 HOURS (run numbers are consecutive across the gaps, so the
+          # runs are never created at all). A window is therefore covered only
+          # if a trigger happens to land inside it. On 2026-08-06 none landed
+          # between 21:39 and 03:27 and the entire night window was missed.
+          #
+          # So when a trigger lands shortly BEFORE a window, hold the runner
+          # and open with the window instead of exiting and hoping for another
+          # trigger that may never come. With a 2h look-ahead against a ~2h
+          # observed cadence, essentially every window gets armed.
+          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -lt "$DAY_START" ]; then
+            WINDOW="day 13:00-18:00 (armed early)"
+            PROCEED=true
+            WAIT_MIN=$(( DAY_START - SOFIA_MIN ))
+            WIN_LEN_MIN=$(( DAY_END - DAY_START ))
+
+          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -lt "$NIGHT_START" ]; then
+            WINDOW="night 23:00-03:00 (armed early)"
+            PROCEED=true
+            WAIT_MIN=$(( NIGHT_START - SOFIA_MIN ))
+            WIN_LEN_MIN=$(( 1440 + NIGHT_END - NIGHT_START ))
+
           else
-            echo "Outside trading windows — skipping."
+            echo "Outside trading windows, and no window opens soon — skipping."
           fi
 
+          WAIT_SECONDS=$(( WAIT_MIN * 60 ))
           RUN_SECONDS=0
-          if [ "$PROCEED" = "true" ]; then
+
+          if [ "$PROCEED" = "true" ] && [ "$WAIT_MIN" -gt 0 ]; then
+            if [ "$WAIT_SECONDS" -gt "$MAX_WAIT_SECONDS" ]; then
+              echo "Next window opens in ${WAIT_MIN} min — beyond the $(( MAX_WAIT_SECONDS / 60 )) min look-ahead, skipping."
+              PROCEED=false
+              WAIT_SECONDS=0
+            else
+              RUN_SECONDS=$(( MAX_TOTAL_SECONDS - WAIT_SECONDS ))
+              [ "$RUN_SECONDS" -gt $(( WIN_LEN_MIN * 60 )) ] && RUN_SECONDS=$(( WIN_LEN_MIN * 60 ))
+              if [ "$RUN_SECONDS" -lt "$MIN_USEFUL_SECONDS" ]; then
+                echo "Only ${RUN_SECONDS}s of polling would fit after the wait — skipping."
+                PROCEED=false
+                WAIT_SECONDS=0
+                RUN_SECONDS=0
+              else
+                echo "Window: $WINDOW — idling ${WAIT_MIN} min, then polling for $(( RUN_SECONDS / 60 )) min."
+              fi
+            fi
+
+          elif [ "$PROCEED" = "true" ]; then
             RUN_SECONDS=$(( (END_MIN - SOFIA_MIN) * 60 ))
             # Clamp: never negative (clock races at a boundary), never beyond
             # the job timeout.
             [ "$RUN_SECONDS" -lt 60 ] && RUN_SECONDS=60
-            [ "$RUN_SECONDS" -gt 18600 ] && RUN_SECONDS=18600
-            echo "Window: $WINDOW — looping for ${RUN_SECONDS}s (until Sofia $(( END_MIN / 60 % 24 )):$(printf '%02d' $(( END_MIN % 60 ))))"
+            [ "$RUN_SECONDS" -gt "$MAX_TOTAL_SECONDS" ] && RUN_SECONDS=$MAX_TOTAL_SECONDS
+            echo "Window: $WINDOW — polling for $(( RUN_SECONDS / 60 )) min (until Sofia $(( END_MIN / 60 % 24 )):$(printf '%02d' $(( END_MIN % 60 ))))"
           fi
 
           {
             echo "proceed=$PROCEED"
+            echo "wait_seconds=$WAIT_SECONDS"
             echo "run_seconds=$RUN_SECONDS"
             echo "window=$WINDOW"
           } >> "$GITHUB_OUTPUT"
@@ -186,6 +237,22 @@ jobs:
         if: steps.window.outputs.proceed == 'true'
         run: |
           POLL_SECONDS=15
+          WAIT_SECONDS=${{ steps.window.outputs.wait_seconds }}
+
+          # Armed early: hold until the window actually opens. Progress is
+          # echoed so a silent multi-hour step isn't mistaken for a hang.
+          if [ "$WAIT_SECONDS" -gt 0 ]; then
+            OPEN_AT=$(( $(date +%s) + WAIT_SECONDS ))
+            echo "Armed for '${{ steps.window.outputs.window }}' — opening at Sofia $(TZ=Europe/Sofia date -d "@$OPEN_AT" '+%H:%M')"
+            while [ "$(date +%s)" -lt "$OPEN_AT" ]; do
+              LEFT=$(( OPEN_AT - $(date +%s) ))
+              [ "$LEFT" -le 0 ] && break
+              echo "  … ${LEFT}s until the window opens (Sofia $(TZ=Europe/Sofia date '+%H:%M'))"
+              [ "$LEFT" -gt 300 ] && sleep 300 || sleep "$LEFT"
+            done
+            echo "Window open."
+          fi
+
           END_TIME=$(( $(date +%s) + ${{ steps.window.outputs.run_seconds }} ))
           POLL=0
           POSTED=0

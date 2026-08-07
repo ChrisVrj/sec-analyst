@@ -17,6 +17,12 @@ Both sit entirely inside EDGAR's filing hours (06:00–22:00 ET), so no cycle is
 wasted. The day window was 11:00–16:00 until Aug 2026, which spent its first
 two hours polling a system that wasn't accepting filings yet.
 
+**GitHub throttles the `*/5` cron to roughly one trigger every 2 hours** — this
+is measured, not theoretical (see AGENTS.md §6). A window would therefore be
+covered only when a trigger happened to land inside it. To compensate, a
+trigger landing within 2 hours *before* a window holds the runner and opens
+with the window rather than exiting. Look for `(armed early)` in the run log.
+
 The LLM is **NVIDIA Nemotron 3** via NVIDIA NIM (free, ~40 req/min, no daily
 cap), with **OpenRouter free models as an automatic fallback**.
 
