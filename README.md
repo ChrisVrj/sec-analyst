@@ -156,6 +156,14 @@ body prose — a NAV report that mentions "redemption of shares at net asset
 value" in passing stays routine. If the urgent webhook fails, the post is
 retried on the main webhook rather than lost.
 
+**New issuances (tier 2) additionally have to be tradeable**, or they demote to
+the main channel. The target is exchange-listed income securities at retail
+denomination — $25-par preferreds, depositary shares, baby bonds. A filing is
+demoted when its body shows `Listing: UNLISTED`, `Par: $1,000` (institutional
+paper, even if NYSE-listed), `Product: common stock`, or no preferred /
+depositary / baby-bond / $25-par signal at all. Redemptions, M&A and tender
+offers are **not** gated — a missed call notice costs more than a spare ping.
+
 ## Tests
 
 ```bash

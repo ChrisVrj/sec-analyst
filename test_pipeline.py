@@ -209,9 +209,14 @@ check("NAV report stays routine despite the word 'redemption'",
       "prose must not trigger routing")
 check("lead emoji alone is enough",
       dispatch.classify_priority("\U0001F501 **X | SC TO-I | 2026-08-05** — offer")[0] == 4)
-check("listing headline classifies tier 2",
+check("listing headline classifies tier 2 when the security is tradeable",
       dispatch.classify_priority(
-          "\U0001F4E2 **X | 424B5 | 2026-08-05** — new pfd\n## \U0001F4E2 LISTING: PUBLIC — NYSE")[0] == 2)
+          "\U0001F4E2 **X | 424B5 | 2026-08-05** — new pfd\n## \U0001F4E2 LISTING: PUBLIC — NYSE\n"
+          "**Product:** preferred stock\n**Par:** $25.00")[0] == 2)
+check("bare listing headline with no tradeable evidence does NOT ping",
+      dispatch.classify_priority(
+          "\U0001F4E2 **X | 424B5 | 2026-08-05** — new pfd\n## \U0001F4E2 LISTING: PUBLIC — NYSE")[0] == 0,
+      "tier 2 fails safe to routine; he still sees it in #sec-filings")
 check("M&A headline classifies tier 3",
       dispatch.classify_priority(
           "**X | 8-K | 2026-08-05** — merger\n## ⚠ M&A — CHANGE OF CONTROL")[0] == 3)
@@ -231,6 +236,112 @@ huge = dispatch.finalize_message("\U0001F6A8 x" + ("y" * 4000), WITH_DOC, prefix
 check("prefix is accounted for when the body must be truncated",
       len(huge) <= dispatch.MAX_DISCORD_CHARS, f"got {len(huge)}")
 check("footer survives a prefixed truncation", "Accession:" in huge)
+
+
+# ---------------------------------------------------------------------------
+# Tradeable-universe gate — verbatim from the #sec-urgent channel on
+# 2026-08-07. Six of these eight pinged Chris and should not have. Every one
+# of the six was a tier-2 "LISTING" block; neither genuine alert was tier 2.
+#
+# The reader trades $25-par exchange-listed preferreds, depositary shares and
+# baby bonds. Not common stock. Not $1,000-par institutional notes.
+# ---------------------------------------------------------------------------
+print("\ntradeable-universe gate (real #sec-urgent posts)")
+
+REAL_POSTS = [
+    # (label, expected_urgent, summary)
+    ("T FWP — $1,000-par senior note, 'NYSE symbol T' is the COMMON ticker", False,
+     '\U0001F4E2 **T | FWP | 2026-08-07** — AT&T intends to list its $1.2B Floating Rate Global Notes due 2028 on the NYSE.\n'
+     'Company: AT&T Inc.\n## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "T"\n'
+     '> "AT&T intends to apply to list the Notes on the New York Stock Exchange."\n'
+     '**Product:** senior note\n**Listing:** PUBLIC (NYSE) symbol "T"\n'
+     '**Coupon:** EURIBOR + 40 bps [floating]\n**Par:** $1,000.00\n**Size:** $1.2bn'),
+
+    ("OCFC 10-Q — body says UNLISTED outright", False,
+     '\U0001F4E2 **OCFC | 10-Q | 2026-08-07** — Completed Flushing acquisition.\n'
+     'Company: OCEANFIRST FINANCIAL CORP\n## \U0001F4E2 LISTING: PUBLIC — NASDAQ SYMBOL "OCFC"\n'
+     '> "Common stock, $0.01 par value per share OCFC NASDAQ"\n'
+     '**Product:** NVCE Stock\n**Listing:** UNLISTED\n**Par:** $0.00001'),
+
+    ("INN 424B5 — common stock ATM", False,
+     '\U0001F4E2 **INN | 424B5 | 2026-08-07** — Summit Hotel files for up to $200m ATM common stock offering.\n'
+     'Company: Summit Hotel Properties, Inc.\n## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "INN"\n'
+     '> "Our common stock is traded on the New York Stock Exchange under the symbol \'INN\'"\n'
+     '**Product:** common stock\n**Listing:** PUBLIC (NYSE) symbol "INN"\n**Par:** $0.01\n**Size:** $200m'),
+
+    ("BNY 424B2 — $1,000-par senior note", False,
+     '\U0001F4E2 **BNY | 424B2 | 2026-08-07** — BNY Mellon prices $300M floating-rate senior notes due 2030.\n'
+     'Company: Bank of New York Mellon Corp\n## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "BNY"\n'
+     '> "The Notes are not intended to be offered to any retail investor in the United Kingdom..."\n'
+     '**Product:** senior note\n**Listing:** PUBLIC (NYSE) symbol "BNY"\n'
+     '**Coupon:** Compounded SOFR + 69 bps [floating]\n**Par:** $1,000.00\n**Size:** $300m'),
+
+    ("AOD N-2ASR — shelf, nothing priced", False,
+     '\U0001F4E2 **AOD | N-2ASR | 2026-08-07** — Shelf registration for up to $250 million.\n'
+     'Company: ABRDN TOTAL DYNAMIC DIVIDEND FUND\n'
+     '**Product:** common shares | preferred shares | notes | subscription rights\n'
+     '**Listing:** PUBLIC (NYSE) symbol "AOD"\n**Size:** $250m'),
+
+    ("CSWC 424B3 — common stock ATM", False,
+     '\U0001F4E2 **CSWC | 424B3 | 2026-08-07** — Capital Southwest adds RBC as sales agent to its ATM programme.\n'
+     'Company: Capital Southwest Corporation\n**NEW ISSUANCE**\n'
+     '**Product:** common stock\n**Listing:** PUBLIC (NASDAQ) symbol "CSWC"\n**Par:** n/d\n**Size:** up to $2.0B'),
+
+    ("MBIN 10-Q — redemption of a listed preferred at $25/depositary share", True,
+     '\U0001F6A8 **MBIN | 10-Q | 2026-08-07** — Redeemed all outstanding Series B Preferred.\n'
+     'Company: MERCHANTS BANCORP\n## \U0001F6A8 REDEMPTION OF PUBLICLY TRADED SECURITY\n'
+     '> "redeemed all outstanding shares of the Series B Preferred Stock ... at a price equal to the '
+     'liquidation preference of $1,000 per share (equivalent to $25 per depositary share), or $125.0 million."'),
+
+    ("SQFT SC TO-I — exchange offer on a listed preferred", True,
+     '\U0001F501 **SQFT | SC TO-I | 2026-08-07** — Presidio offers 5.5 common shares per Series D Preferred.\n'
+     'Company: Presidio Property Trust, Inc.\n## \U0001F501 TENDER / EXCHANGE OFFER\n'
+     '> "offer to exchange ... each outstanding share of its 9.375% Series D Cumulative Redeemable '
+     'Perpetual Preferred Stock ... five and one half shares (5.5) of its Series A Common Stock"\n'
+     '**Security:** Series D Preferred Stock\n**Listing:** Nasdaq (SQFTP)\n**Par value:** $0.01 per share'),
+]
+
+for label, want_urgent, text in REAL_POSTS:
+    tier = dispatch.classify_priority(text)[0]
+    check(("routes urgent   " if want_urgent else "stays routine   ") + label,
+          (tier > 0) == want_urgent,
+          f"tier={tier}")
+
+check("a genuine $25-par baby bond IPO still routes urgent",
+      dispatch.classify_priority(
+          '\U0001F4E2 **XYZ | 424B5 | 2026-08-07** — new baby bond.\n'
+          '## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "XYZL"\n'
+          '**Product:** baby bond\n**Listing:** PUBLIC (NYSE) symbol "XYZL"\n**Par:** $25.00')[0] == 2,
+      "gate must not block the issues he actually wants")
+
+check("a genuine $25-par preferred IPO still routes urgent",
+      dispatch.classify_priority(
+          '\U0001F4E2 **XYZ | 424B5 | 2026-08-07** — new pfd.\n'
+          '## \U0001F4E2 LISTING: PUBLIC — NASDAQ SYMBOL "XYZP"\n'
+          '**Product:** preferred stock\n**Listing:** PUBLIC (NASDAQ) symbol "XYZP"\n**Par:** $25.00')[0] == 2)
+
+
+# ---------------------------------------------------------------------------
+# strip_meta_commentary — the BNY post carried the model's own deliberation
+# and then repeated the whole summary with a different conclusion.
+# ---------------------------------------------------------------------------
+print("\nstrip_meta_commentary")
+
+DOUBLED = (
+    '\U0001F4E2 **BNY | 424B2 | 2026-08-07** — prices $300M notes.\n'
+    '**Product:** senior note\n**Par:** $1,000.00\n\n-------\n'
+    '(Note: Filing does not state NYSE/NASDAQ listing explicitly — highlight block added '
+    'conditionally per guidance; if listing is not literally stated, block should be omitted. '
+    'Re-evaluating: filing contains no literal listing statement — therefore ...\n'
+    '\U0001F4E2 **BNY | 424B2 | 2026-08-07** — prices $300M notes.\n'
+    '**Listing:** UNLISTED (424B2 for medium-term notes)\n'
+)
+cleaned = dispatch.strip_meta_commentary(DOUBLED)
+check("duplicate summary is dropped", cleaned.count("**BNY | 424B2") == 1)
+check("model's deliberation is removed", "Re-evaluating" not in cleaned and "per guidance" not in cleaned)
+check("the real summary survives", "$300M notes" in cleaned and "senior note" in cleaned)
+check("a normal summary is left untouched",
+      dispatch.strip_meta_commentary(REDEMPTION).strip() == REDEMPTION.strip())
 
 
 # ---------------------------------------------------------------------------

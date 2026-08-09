@@ -174,15 +174,38 @@ REQUEST_TIMEOUT     = 90
 
 SYSTEM_PROMPT = """You are a fixed-income trading analyst. Your reader is a professional trader of PUBLICLY TRADED preferred stocks, baby bonds, exchange-traded debt, CEFs, and BDCs. You read one SEC filing at a time and write a structured Discord summary.
 
+== THE READER'S TRADEABLE UNIVERSE (decides everything below) ==
+He trades EXCHANGE-LISTED INCOME SECURITIES at RETAIL denomination:
+  ✅ preferred stock and depositary shares (typically $25 par, sometimes $10/$20/$50)
+  ✅ baby bonds and exchange-traded debt (typically $25 par, trade under their own ticker)
+  ✅ CEF and BDC shares
+He does NOT trade, and must NOT be alerted about:
+  ❌ COMMON STOCK of any kind — ATM programmes, follow-ons, shelf takedowns
+  ❌ $1,000-par institutional paper — senior notes, global notes, medium-term notes.
+     A $1,000 denomination is the single clearest tell. These are sold to
+     institutions and are not what he trades, even when NYSE-listed.
+  ❌ unlisted or structured products
+
+⚠️ TICKER DISCIPLINE. An exchange-traded preferred or baby bond has its OWN
+ticker, distinct from the issuer's common (e.g. common "SQFT" vs preferred
+"SQFTP"; common "MBIN" vs its depositary shares). NEVER present the issuer's
+common-stock ticker as the symbol of the security being offered. If the filing
+does not state a symbol for the offered security, write "n/d". Reporting
+AT&T's $1,000-par notes as 'NYSE SYMBOL "T"' is wrong — "T" is the common.
+
 == PRIORITY ORDER ==
 Lead with the highest-priority event the filing actually discloses. Use it to pick the [EMOJI] for line 1 and to decide which highlight block (if any) to include.
 1. Redemption / call of an existing publicly traded security
-2. New issuance that WILL BE LISTED on NYSE or NASDAQ
+2. New issuance of an EXCHANGE-TRADED INCOME SECURITY from the ✅ list above,
+   to be listed on NYSE or NASDAQ, at retail denomination. A common-stock
+   offering is NEVER priority 2 no matter how clearly it is listed, and
+   neither is a $1,000-par note. Both are priority 7.
 3. M&A or change-of-control affecting publicly traded preferreds / baby bonds
 4. Tender or exchange offer for a publicly traded security
 5. Distribution change on a publicly traded security
 6. CEF / BDC NAV or financial update
-7. Other material event
+7. Other material event — including all common-stock offerings, all $1,000-par
+   institutional notes, and all shelf registrations where nothing is priced yet
 
 == OUTPUT TEMPLATE ==
 
@@ -195,7 +218,11 @@ For redemption / call of publicly traded security:
 ## 🚨 REDEMPTION OF PUBLICLY TRADED SECURITY
 > "verbatim quote naming the series, redemption price, redemption date, and accrued-dividend treatment"
 
-For new publicly listed issuance (only when listing on NYSE or NASDAQ is stated):
+For new publicly listed issuance — ALL FOUR must hold, else omit this block entirely:
+  (a) the security is a preferred / depositary share / baby bond / exchange-traded debt
+  (b) it is NOT common stock and NOT $1,000-par institutional paper
+  (c) listing on NYSE or NASDAQ is literally stated for THAT security
+  (d) the symbol is the offered security's own symbol, not the issuer's common
 ## 📢 LISTING: PUBLIC — <NYSE | NASDAQ> SYMBOL "<X>"
 > "verbatim quote on listing application or expected listing"
 
@@ -276,6 +303,10 @@ An operating company (a manufacturer, bank, REIT, utility, insurer) has NO NAV. 
 2 to 4 sentences of plain prose, in your own words, covering the material content. This is the correct fallback whenever no other section fits — including for operating companies, and for any filing whose figures you cannot cleanly extract.
 
 Do NOT write a "Link:" or "Accession:" line. The system appends the verified EDGAR URL and accession number automatically after your text. Anything you write there is discarded.
+
+== OUTPUT DISCIPLINE ==
+Write the summary EXACTLY ONCE. Then stop.
+Never show your reasoning. Do not write notes to yourself, do not discuss these instructions, do not second-guess a decision in the output, and never write anything like "(Note: ... per guidance ...)" or "Re-evaluating: ...". Decide silently, then write the one final summary. If you conclude a highlight block does not apply, simply omit it — do not explain that you omitted it.
 
 == CONSTRAINTS ==
 - Total message ≤ 1600 characters. Going over gets your ending cut off, so stop early rather than padding.
@@ -595,6 +626,49 @@ URGENT_RULES: list[tuple[int, str, str, tuple[str, ...]]] = [
     (4, "tender / exchange offer", "\U0001F501", ("TENDER", "EXCHANGE OFFER")),
 ]
 
+# ── Tradeable-universe gate for tier 2 ─────────────────────────────────────
+# Chris trades EXCHANGE-LISTED INCOME SECURITIES at retail denomination:
+# $25-par preferreds, depositary shares, baby bonds, exchange-traded debt.
+# He does NOT trade common stock, and does NOT trade $1,000-par institutional
+# paper (senior notes, global notes, medium-term notes).
+#
+# Every false ping observed on 2026-08-07 was a tier-2 "LISTING" block, and
+# every one failed on a field the model had already written correctly in the
+# body — so gate on the body, not on the model's own priority judgement:
+#   T    senior note, Par $1,000        (and "NYSE symbol T" is AT&T's COMMON ticker)
+#   BNY  senior note, Par $1,000        (same — "BNY" is the common)
+#   INN  common stock ATM
+#   CSWC common stock ATM
+#   OCFC Listing: UNLISTED, stated outright
+#   AOD  shelf listing common | preferred | notes | rights, nothing priced
+# Neither genuine alert was tier 2: MBIN was a redemption, SQFT a tender.
+
+_FIELD = r"\*\*{}:\*\*[^\n]*"
+_PRODUCT_COMMON = re.compile(_FIELD.format("Product") + r"common\s+(stock|share)", re.I)
+_LISTING_UNLISTED = re.compile(_FIELD.format("Listing") + r"unlisted", re.I)
+# $1,000 / $1000 par is the institutional denomination. Retail income
+# securities price at $25 (occasionally $10/$20/$50).
+_PAR_INSTITUTIONAL = re.compile(r"\*\*Par:\*\*\s*\$?\s*1[,.]?000", re.I)
+# Positive evidence that the thing being offered is actually in his universe.
+_RETAIL_SECURITY = re.compile(
+    r"preferred\s+(stock|share)|depositary\s+(share|receipt)|baby\s+bond"
+    r"|exchange[- ]traded\s+(debt|note)|\bpar:\*\*\s*\$?2[05]\b",
+    re.I,
+)
+
+
+def _is_tradeable_new_issue(summary: str) -> tuple[bool, str]:
+    """Tier-2 gate. Returns (keep_urgent, reason_if_demoted)."""
+    if _LISTING_UNLISTED.search(summary):
+        return False, "listing states UNLISTED"
+    if _PAR_INSTITUTIONAL.search(summary):
+        return False, "$1,000 par — institutional, not exchange-traded retail"
+    if _PRODUCT_COMMON.search(summary):
+        return False, "common stock, not an income security"
+    if not _RETAIL_SECURITY.search(summary):
+        return False, "no preferred / depositary / baby-bond / $25-par signal"
+    return True, ""
+
 
 def classify_priority(summary: str) -> tuple[int, str]:
     """Returns (tier, label); tier 0 means routine.
@@ -606,16 +680,26 @@ def classify_priority(summary: str) -> tuple[int, str]:
 
     Deliberately NOT a substring search over the whole summary: a NAV report
     mentioning "redemption of shares at NAV" in passing must stay routine.
+
+    Tier 2 additionally has to clear _is_tradeable_new_issue(). Tiers 1, 3 and
+    4 are NOT gated: a redemption or tender on something he holds is the whole
+    point of the channel, and a false negative there costs far more than a
+    false positive.
     """
     lines       = summary.splitlines()
     headers     = " ".join(l.upper() for l in lines if l.lstrip().startswith("#"))
     first_line  = lines[0] if lines else ""
 
     for tier, label, emoji, keywords in URGENT_RULES:
-        if any(k in headers for k in keywords):
-            return tier, label
-        if emoji and emoji in first_line:
-            return tier, label
+        hit = any(k in headers for k in keywords) or (emoji and emoji in first_line)
+        if not hit:
+            continue
+        if tier == 2:
+            keep, why = _is_tradeable_new_issue(summary)
+            if not keep:
+                log.info(f"Demoting new issuance to routine: {why}")
+                return 0, ""
+        return tier, label
     return 0, ""
 
 
@@ -697,8 +781,38 @@ def fit_to_budget(body: str, budget: int) -> str:
     return cut.rsplit(" ", 1)[0].rstrip(" ,;:-") + " …"
 
 
+# Meta-commentary the model sometimes emits instead of just answering. The
+# BNY 424B2 post on 2026-08-07 carried "(Note: Filing does not state
+# NYSE/NASDAQ listing explicitly — highlight block added conditionally per
+# guidance; ... Re-evaluating: ...)" and then repeated the entire summary with
+# a different conclusion.
+_META_LINE_RE = re.compile(
+    r"^\s*(\(?Note:|Re-evaluating|Per strict interpretation|However, as\b|-{3,}\s*$)",
+    re.I,
+)
+# Line 1 of the template: [emoji] **TICKER | FORM | YYYY-MM-DD** — headline
+_HEADLINE_RE = re.compile(r"^.{0,4}\*\*[A-Z0-9.\-]{1,8}\s*\|", re.M)
+
+
+def strip_meta_commentary(body: str) -> str:
+    """Drop the model's deliberation, and keep only the first summary if it
+    wrote more than one.
+
+    Keeping the FIRST is a deliberate choice: it is the one that follows the
+    template. When the model self-corrects in a second copy the two disagree,
+    and there is no reliable way to tell which is right — but routing no
+    longer depends on it, because classify_priority() gates tier 2 on the
+    Product/Par/Listing fields rather than on the model's own verdict.
+    """
+    heads = list(_HEADLINE_RE.finditer(body))
+    if len(heads) > 1:
+        body = body[:heads[1].start()].rstrip()
+    return "\n".join(l for l in body.split("\n") if not _META_LINE_RE.match(l)).strip()
+
+
 def finalize_message(summary: str, filing: dict, prefix: str = "") -> str:
     body = _MODEL_FOOTER_RE.sub("", summary).strip()
+    body = strip_meta_commentary(body)
     body = trim_long_lines(body)
 
     head   = f"{prefix} " if prefix else ""
