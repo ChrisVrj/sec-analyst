@@ -670,35 +670,96 @@ def _is_tradeable_new_issue(summary: str) -> tuple[bool, str]:
     return True, ""
 
 
-def classify_priority(summary: str) -> tuple[int, str]:
+# ── Calendar-form gate for the lead-emoji signal ───────────────────────────
+# Observed 2026-08-10: two Equitable Holdings posts pinged Chris off the line-1
+# emoji alone, with no highlight block anywhere in the body —
+#   🚨 EQH | ARS     — "Annual report to stockholders for fiscal year 2025"
+#   ⚠  EQH | DEF 14A — "Annual meeting to vote on director elections, auditor
+#                       ratification, and say-on-pay on September 23, 2026"
+# Neither filing discloses a tradeable event. The model simply reached for a
+# dramatic emoji on a document that has none, and 🚨/⚠ are tiers 1 and 3.
+#
+# These forms are the worst possible carriers for that mistake: every issuer
+# files a proxy and an annual report every single year, so an occasional emoji
+# slip becomes a steady drip of proxy-season pings on a channel whose whole
+# value is that it only fires when something is tradeable.
+#
+# So the WEAK signal (line-1 emoji) is switched off for forms that exist to
+# satisfy a filing calendar rather than to disclose an event. The STRONG signal
+# is untouched everywhere: a merger-vote proxy that quotes change-of-control
+# terms writes "## ⚠️ M&A — CHANGE OF CONTROL" and still routes urgent. The
+# merger-proxy forms (DEFM14A / PREM14A) are deliberately absent from the set.
+#
+# It is a denylist, not an allowlist, so an unrecognised form keeps today's
+# behaviour — a missed redemption still costs far more than a stray ping.
+_CALENDAR_FORMS: frozenset[str] = frozenset({
+    # Annual-meeting proxies and information statements.
+    "DEF 14A", "DEFA14A", "DEFR14A", "PRE 14A", "PRER14A",
+    "DEF 14C", "DEFA14C", "PRE 14C",
+    # Reports to shareholders and periodic reports.
+    "ARS", "10-K", "10-KT", "10-Q", "10-QT", "20-F", "40-F", "11-K",
+    # Notices that a periodic report will be late — a date, nothing more.
+    "NT 10-K", "NT 10-Q", "NT 20-F", "NT-NCSR",
+    # Fund periodics.
+    "N-CSR", "N-CSRS", "N-PORT", "N-CEN", "N-Q", "N-30D", "N-30B-2",
+    "N-MFP", "N-MFP2", "N-MFP3", "24F-2NT",
+    # Ownership / holdings snapshots.
+    "3", "4", "5", "13F-HR", "13F-NT", "SC 13G",
+})
+
+
+def _is_calendar_form(form_type: str) -> bool:
+    """True for forms filed to satisfy a calendar, not to disclose an event."""
+    form = (form_type or "").strip().upper()
+    if form.endswith("/A"):          # an amendment is the same kind of document
+        form = form[:-2].strip()
+    return form in _CALENDAR_FORMS
+
+
+def classify_priority(summary: str, form_type: str = "") -> tuple[int, str]:
     """Returns (tier, label); tier 0 means routine.
 
     Two independent signals, both anchored so prose can't trigger them:
       · a '## ' highlight header containing the keyword — the strongest, since
         the prompt only emits one when the trigger is literally in the filing
-      · the lead emoji on line 1
+      · the lead emoji on line 1 — the weakest, since the model picks it
+        freely and has been seen putting 🚨 on an annual report
 
     Deliberately NOT a substring search over the whole summary: a NAV report
     mentioning "redemption of shares at NAV" in passing must stay routine.
+
+    `form_type` comes from the EDGAR payload, not from the model, and is what
+    disarms the emoji signal on calendar-driven forms. It defaults to "" —
+    unknown forms stay permissive.
 
     Tier 2 additionally has to clear _is_tradeable_new_issue(). Tiers 1, 3 and
     4 are NOT gated: a redemption or tender on something he holds is the whole
     point of the channel, and a false negative there costs far more than a
     false positive.
+
+    A demoted rule falls through to the next tier rather than returning, so a
+    weak hit on one tier can never suppress a header-backed hit on another.
     """
     lines       = summary.splitlines()
     headers     = " ".join(l.upper() for l in lines if l.lstrip().startswith("#"))
     first_line  = lines[0] if lines else ""
 
     for tier, label, emoji, keywords in URGENT_RULES:
-        hit = any(k in headers for k in keywords) or (emoji and emoji in first_line)
-        if not hit:
+        header_hit = any(k in headers for k in keywords)
+        emoji_hit  = bool(emoji) and emoji in first_line
+        if not (header_hit or emoji_hit):
+            continue
+        if not header_hit and _is_calendar_form(form_type):
+            log.info(
+                f"Demoting {form_type} to routine: lead emoji reads as "
+                f"{label}, but the summary carries no highlight block"
+            )
             continue
         if tier == 2:
             keep, why = _is_tradeable_new_issue(summary)
             if not keep:
                 log.info(f"Demoting new issuance to routine: {why}")
-                return 0, ""
+                continue
         return tier, label
     return 0, ""
 
@@ -888,7 +949,7 @@ def dispatch(filing_path: Path) -> int:
         move_to_processed(filing_path, prefix="err_")
         return DEFAULT_SLEEP  # attempts were spent; rate-limit anyway
 
-    tier, priority_label = classify_priority(summary)
+    tier, priority_label = classify_priority(summary, form_type)
     is_urgent = tier > 0
 
     prefix  = DISCORD_URGENT_MENTION if (is_urgent and DISCORD_URGENT_MENTION) else ""

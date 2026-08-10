@@ -227,6 +227,60 @@ check("redemption outranks a co-occurring M&A block",
           "**X | 8-K** — merger\n## ⚠ M&A — CHANGE OF CONTROL\n"
           "## \U0001F6A8 REDEMPTION OF PUBLICLY TRADED SECURITY") == (1, "redemption"))
 
+
+# ---------------------------------------------------------------------------
+# Calendar-form gate — verbatim from #sec-urgent on 2026-08-10. Both pinged
+# Chris on the lead emoji alone; neither filing carries a highlight block,
+# because neither discloses anything tradeable. A proxy and an annual report
+# land every year for every issuer, so this is the one place a stray emoji
+# turns into a recurring ping.
+# ---------------------------------------------------------------------------
+print("\ncalendar-form gate (real #sec-urgent posts, 2026-08-10)")
+
+EQH_ARS = (
+    "\U0001F6A8 **EQH | ARS | 2026-08-10** — Annual report to stockholders "
+    "for fiscal year ended December 31, 2025.\n"
+    "Company: Equitable Holdings, Inc."
+)
+EQH_PROXY = (
+    "⚠ **EQH | DEF 14A | 2026-08-10** — Annual meeting of stockholders to "
+    "vote on director elections, auditor ratification, and say-on-pay on "
+    "September 23, 2026.\n"
+    "Company: Equitable Holdings, Inc."
+)
+
+check("EQH annual report does NOT ping on a stray siren emoji",
+      dispatch.classify_priority(EQH_ARS, "ARS")[0] == 0,
+      "an ARS discloses nothing; the emoji is the model's whim")
+check("EQH annual-meeting proxy does NOT ping on a stray warning emoji",
+      dispatch.classify_priority(EQH_PROXY, "DEF 14A")[0] == 0,
+      "director elections and say-on-pay are not a change of control")
+check("the same two still reach the main channel",
+      dispatch.classify_priority(EQH_ARS, "ARS")[0] == 0
+      and "Document: <" in dispatch.finalize_message(EQH_ARS, WITH_DOC))
+
+check("a merger-vote proxy that quotes COC terms still pings",
+      dispatch.classify_priority(
+          "⚠ **X | DEF 14A | 2026-08-10** — merger vote\n"
+          "## ⚠ M&A — CHANGE OF CONTROL\n"
+          '> "each Series A share converts into one share of Parent\'s '
+          'Series D preferred"', "DEF 14A")[0] == 3,
+      "the header is evidence; only the bare emoji is disarmed")
+check("DEFM14A is a merger proxy, never gated",
+      dispatch.classify_priority("⚠ **X | DEFM14A | 2026-08-10** — merger vote",
+                                 "DEFM14A")[0] == 3)
+check("an amendment inherits its parent form's gate",
+      dispatch.classify_priority("\U0001F6A8 **X | 10-K/A | 2026-08-10** — restated",
+                                 "10-K/A")[0] == 0)
+check("an 8-K redemption is untouched by the gate",
+      dispatch.classify_priority(REDEMPTION, "8-K") == (1, "redemption"))
+check("an unknown form stays permissive",
+      dispatch.classify_priority("\U0001F501 **X | SC TO-I** — offer", "SC TO-I")[0] == 4)
+check("a weak hit on one tier cannot suppress a header hit on another",
+      dispatch.classify_priority(
+          "\U0001F6A8 **X | 10-K | 2026-08-10** — annual report\n"
+          "## ⚠ M&A — CHANGE OF CONTROL", "10-K")[0] == 3)
+
 mentioned = dispatch.finalize_message(REDEMPTION, WITH_DOC, prefix="@here")
 check("mention prefix is prepended", mentioned.startswith("@here "))
 check("prefixed message still fits the cap", len(mentioned) <= dispatch.MAX_DISCORD_CHARS)
@@ -249,51 +303,54 @@ check("footer survives a prefixed truncation", "Accession:" in huge)
 print("\ntradeable-universe gate (real #sec-urgent posts)")
 
 REAL_POSTS = [
-    # (label, expected_urgent, summary)
-    ("T FWP — $1,000-par senior note, 'NYSE symbol T' is the COMMON ticker", False,
+    # (label, form_type, expected_urgent, summary)
+    # The form type is real, so these also prove the calendar-form gate above
+    # doesn't cost anything: MBIN's redemption was disclosed inside a 10-Q —
+    # a gated form — and must still route urgent on the strength of its header.
+    ("T FWP — $1,000-par senior note, 'NYSE symbol T' is the COMMON ticker", "FWP", False,
      '\U0001F4E2 **T | FWP | 2026-08-07** — AT&T intends to list its $1.2B Floating Rate Global Notes due 2028 on the NYSE.\n'
      'Company: AT&T Inc.\n## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "T"\n'
      '> "AT&T intends to apply to list the Notes on the New York Stock Exchange."\n'
      '**Product:** senior note\n**Listing:** PUBLIC (NYSE) symbol "T"\n'
      '**Coupon:** EURIBOR + 40 bps [floating]\n**Par:** $1,000.00\n**Size:** $1.2bn'),
 
-    ("OCFC 10-Q — body says UNLISTED outright", False,
+    ("OCFC 10-Q — body says UNLISTED outright", "10-Q", False,
      '\U0001F4E2 **OCFC | 10-Q | 2026-08-07** — Completed Flushing acquisition.\n'
      'Company: OCEANFIRST FINANCIAL CORP\n## \U0001F4E2 LISTING: PUBLIC — NASDAQ SYMBOL "OCFC"\n'
      '> "Common stock, $0.01 par value per share OCFC NASDAQ"\n'
      '**Product:** NVCE Stock\n**Listing:** UNLISTED\n**Par:** $0.00001'),
 
-    ("INN 424B5 — common stock ATM", False,
+    ("INN 424B5 — common stock ATM", "424B5", False,
      '\U0001F4E2 **INN | 424B5 | 2026-08-07** — Summit Hotel files for up to $200m ATM common stock offering.\n'
      'Company: Summit Hotel Properties, Inc.\n## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "INN"\n'
      '> "Our common stock is traded on the New York Stock Exchange under the symbol \'INN\'"\n'
      '**Product:** common stock\n**Listing:** PUBLIC (NYSE) symbol "INN"\n**Par:** $0.01\n**Size:** $200m'),
 
-    ("BNY 424B2 — $1,000-par senior note", False,
+    ("BNY 424B2 — $1,000-par senior note", "424B2", False,
      '\U0001F4E2 **BNY | 424B2 | 2026-08-07** — BNY Mellon prices $300M floating-rate senior notes due 2030.\n'
      'Company: Bank of New York Mellon Corp\n## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "BNY"\n'
      '> "The Notes are not intended to be offered to any retail investor in the United Kingdom..."\n'
      '**Product:** senior note\n**Listing:** PUBLIC (NYSE) symbol "BNY"\n'
      '**Coupon:** Compounded SOFR + 69 bps [floating]\n**Par:** $1,000.00\n**Size:** $300m'),
 
-    ("AOD N-2ASR — shelf, nothing priced", False,
+    ("AOD N-2ASR — shelf, nothing priced", "N-2ASR", False,
      '\U0001F4E2 **AOD | N-2ASR | 2026-08-07** — Shelf registration for up to $250 million.\n'
      'Company: ABRDN TOTAL DYNAMIC DIVIDEND FUND\n'
      '**Product:** common shares | preferred shares | notes | subscription rights\n'
      '**Listing:** PUBLIC (NYSE) symbol "AOD"\n**Size:** $250m'),
 
-    ("CSWC 424B3 — common stock ATM", False,
+    ("CSWC 424B3 — common stock ATM", "424B3", False,
      '\U0001F4E2 **CSWC | 424B3 | 2026-08-07** — Capital Southwest adds RBC as sales agent to its ATM programme.\n'
      'Company: Capital Southwest Corporation\n**NEW ISSUANCE**\n'
      '**Product:** common stock\n**Listing:** PUBLIC (NASDAQ) symbol "CSWC"\n**Par:** n/d\n**Size:** up to $2.0B'),
 
-    ("MBIN 10-Q — redemption of a listed preferred at $25/depositary share", True,
+    ("MBIN 10-Q — redemption of a listed preferred at $25/depositary share", "10-Q", True,
      '\U0001F6A8 **MBIN | 10-Q | 2026-08-07** — Redeemed all outstanding Series B Preferred.\n'
      'Company: MERCHANTS BANCORP\n## \U0001F6A8 REDEMPTION OF PUBLICLY TRADED SECURITY\n'
      '> "redeemed all outstanding shares of the Series B Preferred Stock ... at a price equal to the '
      'liquidation preference of $1,000 per share (equivalent to $25 per depositary share), or $125.0 million."'),
 
-    ("SQFT SC TO-I — exchange offer on a listed preferred", True,
+    ("SQFT SC TO-I — exchange offer on a listed preferred", "SC TO-I", True,
      '\U0001F501 **SQFT | SC TO-I | 2026-08-07** — Presidio offers 5.5 common shares per Series D Preferred.\n'
      'Company: Presidio Property Trust, Inc.\n## \U0001F501 TENDER / EXCHANGE OFFER\n'
      '> "offer to exchange ... each outstanding share of its 9.375% Series D Cumulative Redeemable '
@@ -301,8 +358,8 @@ REAL_POSTS = [
      '**Security:** Series D Preferred Stock\n**Listing:** Nasdaq (SQFTP)\n**Par value:** $0.01 per share'),
 ]
 
-for label, want_urgent, text in REAL_POSTS:
-    tier = dispatch.classify_priority(text)[0]
+for label, form, want_urgent, text in REAL_POSTS:
+    tier = dispatch.classify_priority(text, form)[0]
     check(("routes urgent   " if want_urgent else "stays routine   ") + label,
           (tier > 0) == want_urgent,
           f"tier={tier}")

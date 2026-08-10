@@ -156,6 +156,14 @@ body prose — a NAV report that mentions "redemption of shares at net asset
 value" in passing stays routine. If the urgent webhook fails, the post is
 retried on the main webhook rather than lost.
 
+**On calendar-driven forms the emoji alone doesn't ping.** Proxies, annual
+reports, 10-K/10-Q and fund periodics (`ARS`, `DEF 14A`, `N-CSR`, …) need an
+actual `##` highlight block to route urgent, because the model has been seen
+putting 🚨 on an annual report and ⚠ on a routine annual-meeting proxy. Every
+issuer files those every year, so a stray emoji there becomes a recurring ping.
+Merger-vote proxies (`DEFM14A`) are not on the list, and a `DEF 14A` that
+genuinely quotes change-of-control terms still pings on its header.
+
 **New issuances (tier 2) additionally have to be tradeable**, or they demote to
 the main channel. The target is exchange-listed income securities at retail
 denomination — $25-par preferreds, depositary shares, baby bonds. A filing is
