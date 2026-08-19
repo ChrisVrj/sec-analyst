@@ -53,6 +53,7 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 from prefilter import should_skip
+from triage import triage_filing
 
 # ---------------------------------------------------------------------------
 # Config — all secrets come from environment variables (GitHub Secrets)
@@ -207,6 +208,12 @@ Lead with the highest-priority event the filing actually discloses. Use it to pi
 7. Other material event — including all common-stock offerings, all $1,000-par
    institutional notes, and all shelf registrations where nothing is priced yet
 
+A rights offering by a closed-end fund or BDC is priority 2, not priority 7.
+It is a common-stock offering, but it is the exception to the rule above: the
+share count rises on a fixed date at a price struck off NAV, and a fund
+trading at a premium gives that premium up. Treat an initial N-2 as the
+announcement and an N-2/A as a follow-up on terms already disclosed.
+
 == OUTPUT TEMPLATE ==
 
 Line 1: [EMOJI] **TICKER | FORM | YYYY-MM-DD** — one-sentence headline (≤120 chars)
@@ -229,6 +236,18 @@ For new publicly listed issuance — ALL FOUR must hold, else omit this block en
 For use of proceeds that names existing publicly traded securities to be redeemed:
 ## 💸 PROCEEDS WILL REDEEM EXISTING SECURITIES: <ticker(s)>
 > "verbatim quote from use-of-proceeds section"
+Name the coupon and maturity of every security listed, exactly as the filing
+writes them ("the 6.00% 2027 Notes"). Do not convert them to tickers and do
+not merge two series into one. If the sentence joins them with "and/or", say
+so — those are candidates, not commitments.
+
+For a rights offering by a closed-end fund or BDC:
+## 🧨 RIGHTS OFFERING — DILUTION
+> "verbatim quote on the subscription ratio and subscription price"
+Include this whenever a rights offering is disclosed, even though the security
+is common stock. It is the one common-stock event that belongs here: shares
+outstanding rise on a fixed date at a price struck off NAV, and a fund trading
+above NAV loses that premium as the new shares are sold.
 
 For M&A / change-of-control affecting preferreds or baby bonds:
 ## ⚠️ M&A — CHANGE OF CONTROL
@@ -620,11 +639,22 @@ def call_llm(filing: dict) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 URGENT_RULES: list[tuple[int, str, str, tuple[str, ...]]] = [
-    (1, "redemption",              "\U0001F6A8", ("REDEMPTION",)),
-    (2, "public listing",          "\U0001F4E2", ("LISTING:", "PROCEEDS WILL REDEEM")),
+    (1, "redemption",              "\U0001F6A8", ("REDEMPTION", "PROCEEDS WILL REDEEM")),
+    (2, "public listing",          "\U0001F4E2", ("LISTING:",)),
+    (2, "rights offering",         "\U0001F9E8", ("RIGHTS OFFERING",)),
     (3, "M&A / change of control", "⚠",     ("M&A", "CHANGE OF CONTROL")),
     (4, "tender / exchange offer", "\U0001F501", ("TENDER", "EXCHANGE OFFER")),
 ]
+
+# Only this keyword is about a NEW security, so only this keyword is gated by
+# _is_tradeable_new_issue. "PROCEEDS WILL REDEEM" moved to tier 1 in Aug 2026:
+# it names existing listed securities being retired, which is a tier-1 fact,
+# and while it sat in tier 2 a redemption could be demoted because the *new*
+# security failed a retail test that has nothing to do with it. "RIGHTS
+# OFFERING" shares tier 2 but is likewise ungated — a CEF rights offering
+# dilutes common stock, so the retail-income-security test rejects every one
+# of them by construction.
+_TRADEABLE_GATED_KEYWORDS: frozenset[str] = frozenset({"LISTING:"})
 
 # ── Tradeable-universe gate for tier 2 ─────────────────────────────────────
 # Chris trades EXCHANGE-LISTED INCOME SECURITIES at retail denomination:
@@ -650,9 +680,19 @@ _LISTING_UNLISTED = re.compile(_FIELD.format("Listing") + r"unlisted", re.I)
 # securities price at $25 (occasionally $10/$20/$50).
 _PAR_INSTITUTIONAL = re.compile(r"\*\*Par:\*\*\s*\$?\s*1[,.]?000", re.I)
 # Positive evidence that the thing being offered is actually in his universe.
+#
+# ⚠ The par clause must match prose as well as the **Par:** field. Aug 2026:
+# SAR's 424B2 for a $25-par baby bond listing as SAX was demoted for "no
+# preferred / depositary / baby-bond / $25-par signal" — the model had
+# written "$25 par" in the headline instead of a `**Par:**` field, and the
+# pattern only recognised the field. The security was exactly in his
+# universe; the summary just said so in a different shape.
 _RETAIL_SECURITY = re.compile(
     r"preferred\s+(stock|share)|depositary\s+(share|receipt)|baby\s+bond"
-    r"|exchange[- ]traded\s+(debt|note)|\bpar:\*\*\s*\$?2[05]\b",
+    r"|exchange[- ]traded\s+(debt|note)"
+    r"|\bpar:\*\*\s*\$?2[05]\b"          # **Par:** $25
+    r"|\$\s?2[05](\.00)?\s+par\b"        # "$25 par", "at $25.00 par"
+    r"|\bpar\s+(value\s+)?of\s+\$\s?2[05](\.00)?\b",   # "par value of $25"
     re.I,
 )
 
@@ -755,7 +795,13 @@ def classify_priority(summary: str, form_type: str = "") -> tuple[int, str]:
                 f"{label}, but the summary carries no highlight block"
             )
             continue
-        if tier == 2:
+        if header_hit and any(k in headers for k in keywords
+                              if k in _TRADEABLE_GATED_KEYWORDS):
+            keep, why = _is_tradeable_new_issue(summary)
+            if not keep:
+                log.info(f"Demoting new issuance to routine: {why}")
+                continue
+        elif not header_hit and tier == 2 and label == "public listing":
             keep, why = _is_tradeable_new_issue(summary)
             if not keep:
                 log.info(f"Demoting new issuance to routine: {why}")
@@ -950,6 +996,26 @@ def dispatch(filing_path: Path) -> int:
         return DEFAULT_SLEEP  # attempts were spent; rate-limit anyway
 
     tier, priority_label = classify_priority(summary, form_type)
+
+    # The filing gets a vote of its own. classify_priority reads the model's
+    # wording, which is fine until the model describes the event correctly and
+    # words it differently -- CLM's rights offering had no highlight block at
+    # all, so it routed to the main channel with an accurate summary nobody
+    # read until Monday. triage_filing reads form_type and filing_text, which
+    # do not vary with phrasing. It can only promote: whichever source calls
+    # it more urgent wins.
+    det_tier, det_label, det_notes = triage_filing(
+        form_type, filing.get("filing_text", ""), filing.get("entity_name", ""))
+    if det_tier and (tier == 0 or det_tier < tier):
+        log.info(
+            f"Promoting {ticker} {form_type} to P{det_tier} from the filing "
+            f"itself ({det_label}); summary alone gave "
+            f"{'P' + str(tier) if tier else 'routine'}"
+        )
+        for note in det_notes:
+            log.info(f"  {note}")
+        tier, priority_label = det_tier, det_label
+
     is_urgent = tier > 0
 
     prefix  = DISCORD_URGENT_MENTION if (is_urgent and DISCORD_URGENT_MENTION) else ""

@@ -34,6 +34,9 @@ sec-poller/
 ├── openrouter_dispatch.py   # reads inbox, calls NVIDIA NIM (OpenRouter fallback), posts to Discord
 │                           #   (filename is historical — it is provider-agnostic now)
 ├── prefilter.py             # drops noise filings before any LLM call
+├── triage.py                # urgency from form_type + filing_text, independent
+│                           #   of how the model words its summary; can only
+│                           #   promote a filing, never demote one
 ├── manage_watchlist.py      # add/remove tickers by symbol; edits cik_map.json
 ├── test_pipeline.py         # offline regression suite
 ├── cik_map.json             # your watchlist: {"TICKER": "0001234567", ...}

@@ -417,6 +417,163 @@ check("plain content is untouched",
 
 
 # ---------------------------------------------------------------------------
+# triage — Aug 2026: two filings routed to the main channel that should have
+# paged, both because urgency was read off the model's wording.
+#
+#   CLM  N-2   2026-08-14 23:45 — 1-for-3 rights offering at 104% of NAV on a
+#              fund at a 14.7% premium. Accurate summary, no highlight block,
+#              📋 on line 1. Tier 0. CLM -6.6% and CRF -6.8% over the next
+#              three sessions.
+#   SAR  424B2 2026-08-18 — $25-par baby bond listing as SAX, proceeds
+#              earmarked to redeem the 6.00% and 8.00% 2027 Notes. The LISTING
+#              block fired tier 2, then the tradeable gate demoted it: the
+#              model wrote "$25 par" as prose and the pattern only matched a
+#              **Par:** field.
+#
+# triage_filing reads form_type and filing_text, which do not change with
+# phrasing, and can only promote.
+# ---------------------------------------------------------------------------
+print("\ntriage — urgency from the filing, not the wording")
+
+from triage import triage_filing, find_redemption_targets, split_form  # noqa: E402
+
+CLM_N2_TEXT = (
+    "Cornerstone Strategic Investment Fund, Inc. is issuing non-transferable "
+    "rights to its holders of record of shares of common stock. For every "
+    "three (3) Rights a Stockholder receives, such Stockholder will be "
+    "entitled to buy one (1) new Share. The subscription price per Share will "
+    "be 104% of NAV per Share as calculated at the close of trading on the "
+    "date of expiration of the Offering."
+)
+
+SAX_TEXT = (
+    "We are offering $ in aggregate principal amount of % notes due 2031. We "
+    "intend to list the Notes on the New York Stock Exchange under the trading "
+    "symbol 'SAX'. We expect to use the net proceeds from this offering to "
+    "redeem the outstanding 6.00% 2027 Notes, redeem the outstanding 8.00% "
+    "2027 Notes, and/or repay a portion of the outstanding indebtedness under "
+    "the Valley Credit Facility."
+)
+
+tier, label, _ = triage_filing("N-2", CLM_N2_TEXT)
+check("CLM rights offering reaches an urgent tier from the filing alone",
+      tier == 2, f"got tier={tier}")
+
+tier, label, notes = triage_filing("424B2", SAX_TEXT)
+check("SAR use-of-proceeds redemption is tier 1, above the new listing",
+      tier == 1, f"got tier={tier}")
+check("the redeemed series are named, both of them",
+      any("6%" in n and "8%" in n for n in notes), f"notes={notes}")
+
+targets = find_redemption_targets(SAX_TEXT)
+check("both series are extracted with coupon and year",
+      [(t["coupon"], t["year"]) for t in targets] == [(6.0, 2027), (8.0, 2027)],
+      str(targets))
+check("an 'and/or' use of proceeds is not reported as committed",
+      not any(t["committed"] for t in targets))
+check("a notice of redemption is reported as committed",
+      find_redemption_targets(
+          "The Company has issued a notice of redemption for all of the "
+          "outstanding 6.00% 2027 Notes.")[0]["committed"])
+
+# The 8.125% 2027 Notes (SAY) are NOT named in the SAX filing. Rounding the
+# coupon or matching the year alone would call a bond nobody is calling.
+check("a series the filing does not name is not extracted",
+      all(t["coupon"] != 8.125 for t in targets))
+
+check("a capital-structure mention is not a redemption",
+      find_redemption_targets(
+          "Our capital structure includes the 6.00% 2027 Notes, which remain "
+          "outstanding.") == [])
+
+# Base form versus amendment. The announcement moves price; the amendment
+# sets a date. Across CLM/CRF's last three offerings the three sessions after
+# the base N-2 were negative 6 of 6, and positive 4 of 6 after the N-2/A.
+check("an N-2/A does not page on form type alone",
+      triage_filing("N-2/A", "Amendment to the registration statement.")[0] == 0)
+check("an amendment carrying a redemption still pages",
+      triage_filing("N-2/A", SAX_TEXT)[0] == 1)
+check("an N-2/A that restates rights terms still pages",
+      triage_filing("N-2/A", CLM_N2_TEXT)[0] == 2)
+
+check("split_form strips the amendment suffix", split_form("N-2/A") == ("N-2", True))
+check("a routine fund periodic stays routine",
+      triage_filing("NPORT-P", "Monthly portfolio holdings report.")[0] == 0)
+check("an 8-K with nothing structural stays routine",
+      triage_filing("8-K", "The Company announced quarterly results.")[0] == 0)
+
+
+# ---------------------------------------------------------------------------
+# classify_priority — the two fixes that let the summary path work as well.
+# ---------------------------------------------------------------------------
+print("\nclassify_priority — redemption tier and the $25-par prose")
+
+check("'$25 par' in prose clears the tradeable gate",
+      dispatch._is_tradeable_new_issue(
+          '\U0001F4E2 **SAX | 424B2** — offering $SAX notes due 2031 at $25 par\n'
+          '## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "SAX"')[0])
+check("'par value of $25' clears it too",
+      dispatch._is_tradeable_new_issue("baby note with a par value of $25")[0])
+check("$1,000 par is still institutional",
+      not dispatch._is_tradeable_new_issue(
+          'Senior note\n**Par:** $1,000.00\n## LISTING: PUBLIC — NYSE')[0])
+
+# PROCEEDS WILL REDEEM moved to tier 1. While it sat in tier 2 it was gated by
+# a test about the NEW security, so a redemption of listed bonds could be
+# demoted because the bond being issued did not look retail.
+tier, label = dispatch.classify_priority(
+    '\U0001F4E2 **SAX | 424B2 | 2026-08-18** — new notes\nCompany: Saratoga\n'
+    '## \U0001F4B8 PROCEEDS WILL REDEEM EXISTING SECURITIES: 6.00% 2027 Notes\n'
+    '> "We expect to use the net proceeds to redeem the outstanding 6.00% 2027 Notes."\n'
+    '**Product:** senior note\n**Par:** $1,000.00', "424B2")
+check("PROCEEDS WILL REDEEM is tier 1 and not gated by the new-issue test",
+      tier == 1, f"got tier={tier} label={label!r}")
+
+tier, _ = dispatch.classify_priority(
+    '\U0001F9E8 **CLM | N-2 | 2026-08-14** — rights offering\nCompany: Cornerstone\n'
+    '## \U0001F9E8 RIGHTS OFFERING — DILUTION\n'
+    '> "For every three (3) Rights a Stockholder receives..."\n'
+    '**Product:** common stock', "N-2")
+check("a rights-offering block routes urgent despite being common stock",
+      tier == 2, f"got tier={tier}")
+
+# A genuine LISTING block is still gated — that protection is unchanged.
+tier, _ = dispatch.classify_priority(
+    '\U0001F4E2 **INN | 424B5 | 2026-08-07** — ATM programme\nCompany: Summit\n'
+    '## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "INN"\n'
+    '**Product:** common stock\n**Par:** n/d', "424B5")
+check("a common-stock ATM is still demoted", tier == 0, f"got tier={tier}")
+
+
+# ---------------------------------------------------------------------------
+# DELIBERATE BEHAVIOUR CHANGE, Aug 2026 — read this before "fixing" it.
+#
+# "AOD N-2ASR — shelf, nothing priced" is in the tradeable-gate table above as
+# a filing that must STAY ROUTINE, tuned away on 2026-08-07 as a false ping.
+# It still stays routine on the summary path, which is what that table tests.
+#
+# But triage_filing now promotes shelf registrations on form type, because the
+# instruction changed: shelf registrations are wanted in #sec-urgent. So an
+# N-2ASR pages via the deterministic path even though the summary path demotes
+# it. That is intended, and it is the one place where this work makes the
+# channel louder rather than quieter. If shelf noise becomes the problem,
+# remove the *ASR forms from CAPITAL_RAISE_FORMS in triage.py — do not
+# reinstate a gate, which is what silenced CLM.
+# ---------------------------------------------------------------------------
+print("\nshelf registrations — louder on purpose")
+
+aod_summary = ('\U0001F4E2 **AOD | N-2ASR | 2026-08-07** — Shelf registration.\n'
+               '**Product:** common shares | preferred shares | notes\n'
+               '**Listing:** PUBLIC (NYSE) symbol "AOD"\n**Size:** $250m')
+check("summary path still demotes an unpriced shelf",
+      dispatch.classify_priority(aod_summary, "N-2ASR")[0] == 0)
+check("filing path promotes it, as now requested",
+      triage_filing("N-2ASR", "Shelf registration statement for up to "
+                              "$250 million of common shares, preferred "
+                              "shares, notes and subscription rights.")[0] == 2)
+
+
+# ---------------------------------------------------------------------------
 print()
 if failures:
     print(f"{len(failures)} FAILED: {', '.join(failures)}")
