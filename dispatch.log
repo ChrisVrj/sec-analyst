@@ -1,0 +1,31 @@
+2026-08-19 20:10:14 [DISPATCH] INFO DISCORD_WEBHOOK len=1 prefix='x'
+2026-08-19 20:10:14 [DISPATCH] INFO Demoting new issuance to routine: no preferred / depositary / baby-bond / $25-par signal
+2026-08-19 20:13:34 [DISPATCH] INFO DISCORD_WEBHOOK len=1 prefix='x'
+2026-08-19 20:13:43 [DISPATCH] INFO DISCORD_WEBHOOK len=31 prefix='https://example.invalid/webhook'
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting new issuance to routine: no preferred / depositary / baby-bond / $25-par signal
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting ARS to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting DEF 14A to routine: lead emoji reads as M&A / change of control, but the summary carries no highlight block
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting ARS to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting 10-K/A to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting 10-K to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting new issuance to routine: $1,000 par — institutional, not exchange-traded retail
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting new issuance to routine: listing states UNLISTED
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting new issuance to routine: $1,000 par — institutional, not exchange-traded retail
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
+2026-08-19 20:13:43 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
+2026-08-19 20:14:53 [DISPATCH] INFO DISCORD_WEBHOOK len=31 prefix='https://example.invalid/webhook'
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: no preferred / depositary / baby-bond / $25-par signal
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting ARS to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting DEF 14A to routine: lead emoji reads as M&A / change of control, but the summary carries no highlight block
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting ARS to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting 10-K/A to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting 10-K to routine: lead emoji reads as redemption, but the summary carries no highlight block
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: $1,000 par — institutional, not exchange-traded retail
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: listing states UNLISTED
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: $1,000 par — institutional, not exchange-traded retail
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
+2026-08-19 20:14:53 [DISPATCH] INFO Demoting new issuance to routine: common stock, not an income security
