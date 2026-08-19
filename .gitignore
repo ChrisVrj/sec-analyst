@@ -1,0 +1,21 @@
+# Runtime log. Never commit it: the dispatcher writes the first 50 characters
+# of DISCORD_WEBHOOK on startup, and this repo is public. That prefix stops
+# short of the token today, but a log file is the wrong place to rely on that.
+dispatch.log
+*.log
+
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Filings pulled by the poller. seen_accessions.json and
+# dispatched_accessions.json ARE tracked on purpose -- they are the cache that
+# stops a restart re-posting yesterday's filings.
+filings-inbox/*.json
+!filings-inbox/test_*.json
+filings-inbox/processed/
+
+# Local environment
+.env
+.venv/
+venv/
