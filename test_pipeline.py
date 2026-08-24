@@ -110,6 +110,63 @@ check(
 
 
 # ---------------------------------------------------------------------------
+# prefilter / N-PX — Aug 2026: five proxy voting records reached #sec-filings
+# in twenty minutes on the night of the 21st. Each one reports how a fund
+# voted OTHER issuers' proxies through the previous 30 June; the proposals
+# were in those issuers' DEF 14As and the outcomes in an 8-K Item 5.07 months
+# earlier. Real accession: 0001193125-26-361204 (PPT).
+# ---------------------------------------------------------------------------
+
+check(
+    "N-PX is skipped",
+    prefilter.should_skip({
+        "form_type": "N-PX", "entity_name": "Franklin Premier Income Trust",
+        "filing_text": "Annual proxy voting report for the period ended June 30, 2026.",
+    })[0],
+)
+
+check(
+    "N-PX/A is skipped too",
+    prefilter.should_skip({"form_type": "N-PX/A", "entity_name": "Franklin Managed Municipal",
+                           "filing_text": "Amended proxy voting report."})[0],
+)
+
+check(
+    "a third party's reverse split in a ballot line does not rescue an N-PX",
+    prefilter.should_skip({
+        "form_type": "N-PX", "entity_name": "Franklin Managed Municipal Income Trust",
+        "filing_text": ("Item 3: Approve Reverse Stock Split. Vote cast: FOR. "
+                        "Item 4: Approve Merger Agreement. Vote cast: FOR."),
+    })[0],
+    "the split belongs to a portfolio company, not the filer",
+)
+
+check(
+    "a bankruptcy ballot in an N-PX is still an N-PX",
+    prefilter.should_skip({
+        "form_type": "N-PX", "entity_name": "Franklin Premier Income Trust",
+        "filing_text": ("Voting instructions on three bondholder matters concerning "
+                        "Wolfspeed, Inc. (CUSIP 977852AD4): acceptance of a "
+                        "restructuring plan, opting out of releases, and eligible "
+                        "holder certification. 182,000 ballots voted FOR."),
+    })[0],
+    "stale by filing date, and NPORT-P carries the holding more directly",
+)
+
+check(
+    "the skip reason names the form, for dispatch.log",
+    "N-PX" in prefilter.should_skip({"form_type": "N-PX", "filing_text": ""})[1],
+)
+
+check(
+    "N-CSR is not caught by the N-PX rule",
+    not prefilter.should_skip({"form_type": "N-CSR", "entity_name": "BGT",
+                               "filing_text": "Annual report to shareholders."})[0],
+    "only proxy voting records are dropped, not fund periodics",
+)
+
+
+# ---------------------------------------------------------------------------
 # finalize_message — Aug 2026: a BGT N-CSR/A post was cut mid-word at
 # "Does not reflect deri" and lost its Link/Accession footer entirely,
 # because summary[:1900] truncated blindly. The footer is the one thing the
