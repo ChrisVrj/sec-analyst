@@ -1,13 +1,14 @@
 """
 prefilter.py — drop noise filings before the LLM call.
 
-Two filters:
+Three filters:
   1. Form 3/4/5 ownership filings: skip unless the filer matches a tracked
      activist (Saba, Bulldog, Karpus, RiverNorth, etc.).
   2. 424B / FWP offerings: skip retail structured notes (autocallable,
      contingent coupon, market-linked, etc.) AND unlisted bank senior notes
      ($1k denomination, no exchange listing — Citi/JPM/BAC/RBC etc.).
      Keep only offerings that explicitly mention listing on NYSE / NASDAQ.
+  3. Form N-PX proxy voting records: skip unconditionally. See below.
 
 Edit the lists below to tune. Matching is substring, case-insensitive.
 """
@@ -137,6 +138,32 @@ LISTED_SIGNALS: list[str] = [
     "trade on the nasdaq stock market under the symbol",
 ]
 
+# ---------------------------------------------------------------------------
+# Proxy voting records — Aug 2026: five N-PX filings reached #sec-filings
+# inside twenty minutes on the night of the 21st (PMM, PMO, PPT, DBRG and
+# others), each one an LLM call and a post, and none of them about the filer.
+#
+# An N-PX reports how a fund voted OTHER issuers' proxies over the twelve
+# months to 30 June, filed by 31 August. Everything in it was public long
+# before: the proposal in that issuer's DEF 14A weeks ahead of the meeting,
+# the outcome in an 8-K Item 5.07 within four business days of it. What N-PX
+# adds is which way this one holder voted, as much as fourteen months late.
+#
+# It is dropped unconditionally rather than demoted, because the body is a
+# list of other companies' corporate actions and nothing downstream can tell
+# them from the filer's own. PPT's filing of 2026-08-21 is a bankruptcy ballot
+# on Wolfspeed debt; a ballot line reading "Approve Reverse Stock Split" is
+# some portfolio company's split, not the fund's. Sending that to the model
+# only buys an accurate summary of an event that cannot move the ticker it is
+# filed under.
+#
+# 686 CIKs are tracked and the deadline is the same date for all of them, so
+# this is a concentrated annual burst, not a trickle.
+#
+# Volume, not judgement, is the reason this is in prefilter and not in
+# triage.py: skipping here is what avoids the token spend.
+PROXY_VOTING_FORMS: set[str] = {"N-PX", "N-PX/A"}
+
 OWNERSHIP_FORMS: set[str] = {"3", "4", "5", "3/A", "4/A", "5/A"}
 OFFERING_FORMS: set[str] = {
     "424B1", "424B2", "424B3", "424B4", "424B5", "424B7", "424B8", "FWP",
@@ -210,6 +237,14 @@ def should_skip(filing: dict) -> tuple[bool, str]:
     calling the LLM. reason is a short string for the dispatch.log.
     """
     form_type = (filing.get("form_type", "") or "").strip().upper()
+
+    # 0) N-PX — a record of votes cast on other issuers' securities, never an
+    #    event in the filer's own. Checked first and without reading the text,
+    #    since the text is what misleads every reader downstream.
+    if form_type in PROXY_VOTING_FORMS:
+        return True, (f"{form_type} proxy voting record — votes on other "
+                      f"issuers, through 30 June, already public via their "
+                      f"DEF 14A and 8-K Item 5.07")
 
     # 1) Form 3 / 4 / 5 — skip unless filed by a tracked activist
     if form_type in OWNERSHIP_FORMS:
