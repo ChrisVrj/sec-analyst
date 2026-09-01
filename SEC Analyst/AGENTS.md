@@ -339,7 +339,16 @@ Chris reported: RIV's and NMCO's rights offerings never arrived, and three Goldm
 
    The two routing guards now compose deliberately, and the ordering in `dispatch()` matters: `render_body()` first, `classify_priority()` on that body, then `triage_filing()` on the payload, promote-only. One stops a ping whose justification the reader cannot see; the other stops a miss the reader never learns about. Neither weakens the other, because triage can only promote.
 
-`test_pipeline.py` carries 124 checks after the merge, including the first coverage of `edgar_poller.py` (feed paging, role-entry dedupe, horizon stop) — previously listed in §9 as the most valuable untested area.
+7. **The model's scratchpad was published as a summary** (2026-09-01 17:54, `#sec-urgent`, USB `424B3`). The post was the model thinking out loud, verbatim — *"We need to produce a Discord summary... What emoji? ... We must not include highlight block"* — and it pinged, because `triage.py` promotes every `424B*` to P2 on form type and nothing downstream asked whether the text was a summary at all. `strip_reasoning()` could not help: none of it was inside `<think>` tags. The likely route in is the `reasoning_content` salvage in `_post_chat()`, which existed to rescue an answer when `content` came back empty and had no way to tell an answer from a scratchpad.
+
+   Three parts to the fix:
+   - `_HEADLINE_RE` now recognises an **`n/d` ticker**. It never did (`[A-Z0-9.\-]` matches neither the lowercase letters nor the slash), so `strip_meta_commentary()`'s duplicate-summary guard was silently a no-op on exactly the filings most likely to confuse the model — most bank paper has no symbol of its own.
+   - `_post_chat()` rejects a completion with no headline, which puts it through the existing fallback chain rather than publishing it. The `reasoning_content` salvage is now conditional on the same check.
+   - `dispatch()` refuses to post one that still has no headline after every provider, and sends a ⚠️ alert with the EDGAR link instead. Never urgent, never with a mention.
+
+   **The headline check is anchored to the start of a line, with at most 4 characters of lead-in for the emoji, and that anchor is the whole defence.** The leaked post contained the string `So line 1: [EMOJI] **n/d | 424B3 | 2026-09-01** — ...` — a perfectly well-formed headline sitting 18 characters into a sentence. An unanchored search would have passed it. Do not relax it.
+
+`test_pipeline.py` carries 132 checks after the merge, including the first coverage of `edgar_poller.py` (feed paging, role-entry dedupe, horizon stop) — previously listed in §9 as the most valuable untested area.
 
 ---
 

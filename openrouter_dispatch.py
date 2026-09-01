@@ -543,13 +543,31 @@ def _post_chat(provider: dict, model: str, filing: dict, extra: dict) -> str:
 
     # Reasoning models may return the whole answer in reasoning_content when
     # content comes back empty — better to salvage it than alert on nothing.
+    # Salvage only what looks like a summary, though: this field is the
+    # scratchpad by definition, and on 2026-09-01 a USB 424B3 pricing
+    # supplement was published straight out of it, deliberation and all.
     if not content:
-        content = strip_reasoning(message.get("reasoning_content") or "")
-        if content:
+        salvaged = strip_reasoning(message.get("reasoning_content") or "")
+        if looks_like_summary(salvaged):
+            content = salvaged
             log.warning(f"{provider['name']}/{model}: answer arrived in reasoning_content")
+        elif salvaged:
+            log.warning(
+                f"{provider['name']}/{model}: reasoning_content holds working-out, "
+                f"not a summary — discarding {len(salvaged)} chars"
+            )
 
     if not content:
         raise ValueError(f"{provider['name']} returned empty content")
+
+    # A completion with no headline is the model narrating the task instead of
+    # doing it. Raising here is deliberate: it costs nothing but a retry, and
+    # the next model on the chain usually answers properly.
+    if not looks_like_summary(content):
+        raise ValueError(
+            f"{provider['name']} returned no summary headline "
+            f"(first 120 chars: {content[:120]!r})"
+        )
 
     return content
 
@@ -935,7 +953,33 @@ def _drop_prompt_echo(line: str) -> str:
     kept = [p for p in _SENTENCE_SPLIT_RE.split(line) if not _PROMPT_ECHO_RE.search(p)]
     return " ".join(kept).strip()
 # Line 1 of the template: [emoji] **TICKER | FORM | YYYY-MM-DD** — headline
-_HEADLINE_RE = re.compile(r"^.{0,4}\*\*[A-Z0-9.\-]{1,8}\s*\|", re.M)
+#
+# Two properties do real work here:
+#
+#   · The ticker field allows lowercase and a slash. It is literally "n/d"
+#     whenever the offered security has no symbol of its own, which is most
+#     bank paper — and the old [A-Z0-9.\-] class did not match that, so the
+#     duplicate-summary guard in strip_meta_commentary() was a no-op on
+#     exactly the filings most likely to confuse the model.
+#
+#   · It is anchored to the START of a line, with at most 4 characters of
+#     lead-in for the emoji. That anchor is what separates a summary from the
+#     model narrating one: the leaked USB scratchpad on 2026-09-01 contained
+#     the string "So line 1: [EMOJI] **n/d | 424B3 | 2026-09-01** — ..." with
+#     a perfectly well-formed headline sitting 18 characters into a sentence.
+#     Do not relax the anchor.
+_HEADLINE_RE = re.compile(r"^.{0,4}\*\*\s*[^|*\n]{1,14}\|[^*\n]{1,40}\*\*", re.M)
+
+
+def looks_like_summary(text: str) -> bool:
+    """True if this is a summary rather than the model thinking out loud.
+
+    The template puts the headline on line 1; three lines of slack covers a
+    leading blank or a stray preamble. Anything else is a completion we should
+    not publish — see the alert path in dispatch().
+    """
+    head = "\n".join((text or "").lstrip().splitlines()[:3])
+    return bool(_HEADLINE_RE.search(head))
 
 
 def strip_meta_commentary(body: str) -> str:
@@ -1073,6 +1117,28 @@ def dispatch(filing_path: Path) -> int:
     # the body is identical either way and a late routing decision can never
     # re-truncate what was already classified.
     body = render_body(summary, body_budget(filing, DISCORD_URGENT_MENTION))
+
+    # Last line of defence. Every model on the chain can return working-out
+    # instead of a summary, and triage.py will happily promote a 424B* to P2
+    # on form type alone, so without this the reader gets pinged to read the
+    # model's notes to itself. Alert with the link instead — a filing that
+    # needs manual review is a far better outcome than a fake summary, and the
+    # ❌ makes it visible rather than silent.
+    if not looks_like_summary(body):
+        log.error(
+            f"No summary headline for {ticker} {accession} after every "
+            f"provider — refusing to post. Body began: {body[:150]!r}"
+        )
+        send_discord_alert(
+            f"⚠️ **{ticker}** | {form_type} | {file_date}\n"
+            f"The model returned working-out instead of a summary, so nothing "
+            f"was posted for this filing.\n"
+            f"Manual review: <{edgar_url}>\n"
+            f"`{accession}`"
+        )
+        move_to_processed(filing_path, prefix="err_")
+        return provider["sleep"]
+
     tier, priority_label = classify_priority(body, form_type)
 
     # The filing gets a vote of its own. classify_priority reads the model's

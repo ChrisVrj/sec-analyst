@@ -861,6 +861,75 @@ check("…and triage promotes it from the filing text",
 
 
 # ---------------------------------------------------------------------------
+# Never publish the model's working-out — 2026-09-01, #sec-urgent.
+#
+# A USB 424B3 post that was the model thinking out loud, verbatim: "We need to
+# produce a Discord summary... What emoji? ... We must not include highlight
+# block". It pinged, because triage.py promotes every 424B* to P2 on form type
+# and nothing downstream asked whether the text was a summary at all.
+#
+# strip_reasoning() could not help — none of it was inside <think> tags. It
+# arrived in the completion, most likely salvaged out of reasoning_content by
+# the empty-content fallback in _post_chat().
+# ---------------------------------------------------------------------------
+print("\nscratchpad leak")
+
+# Reconstructed from the post. Note the well-formed headline in the middle of
+# the fourth paragraph — the model quoting the template back at itself is
+# exactly why the headline check is anchored to the start of a line.
+LEAKED_SCRATCHPAD = (
+    "We need to produce a Discord summary. This is a 424B3 pricing supplement "
+    "for US Bancorp Senior Medium-Term Notes, Series EE. These are senior notes, "
+    "$1,000 denomination, unsecured, callable fixed rate. This is institutional "
+    "paper ($1,000 par), not retail.\n\n"
+    "We must not include highlight block because not priority 1-4. Use OTHER "
+    "section: 2-4 sentences plain prose.\n\n"
+    "We need to stay under 1600 chars, easy.\n\n"
+    "We need to include ticker? Since no ticker for the offered security, we "
+    'write "n/d". So line 1: [EMOJI] **n/d | 424B3 | 2026-09-01** \u2014 ...\n\n'
+    "What emoji? Since it's other prospectus/new issuance (priority 7), emoji: "
+    "\U0001F4C4 other prospectus / new issuance."
+)
+
+REAL_USB = (
+    '\U0001F4C4 **USB | 424B3 | 2026-09-01** \u2014 U.S. Bancorp prices $1,000-par '
+    'senior medium-term notes at 5.00% due 2030, not exchange-listed.\n'
+    'Company: US BANCORP \\DE\\\n'
+    '**Product:** senior note\n**Listing:** UNLISTED\n**Coupon:** 5.00% fixed\n'
+    '**Par:** $1,000\n**Maturity:** 2030-03-10'
+)
+
+check("the leaked scratchpad is not a summary",
+      not dispatch.looks_like_summary(LEAKED_SCRATCHPAD))
+check("a headline quoted mid-sentence does not rescue it",
+      "**n/d | 424B3 | 2026-09-01**" in LEAKED_SCRATCHPAD
+      and not dispatch.looks_like_summary(LEAKED_SCRATCHPAD),
+      "the start-of-line anchor is the whole defence here")
+check("a real summary is still a summary", dispatch.looks_like_summary(REAL_USB))
+check("it survives render_body",
+      dispatch.looks_like_summary(
+          dispatch.render_body(REAL_USB, dispatch.body_budget(WITH_DOC, "@here"))))
+check("so does a redemption", dispatch.looks_like_summary(REDEMPTION))
+check("and a two-field headline with no date",
+      dispatch.looks_like_summary("\U0001F501 **X | SC TO-I** \u2014 offer"),
+      "the check must not become a template validator")
+check("an empty completion is not a summary", not dispatch.looks_like_summary(""))
+
+# The "n/d" ticker is what most bank paper carries, and the old headline
+# pattern ([A-Z0-9.\-]) never matched it — so the duplicate-summary guard was
+# silently a no-op on exactly those posts.
+ND_DOUBLED = (
+    '\U0001F4CB **n/d | 424B2 | 2026-08-31** \u2014 Goldman prices $4.6M callable MTNs.\n'
+    '**Product:** senior note\n\n(Note: reconsidering the listing.)\n'
+    '\U0001F4CB **n/d | 424B2 | 2026-08-31** \u2014 Goldman prices $4.6M callable MTNs.\n'
+    '**Listing:** UNLISTED'
+)
+check("a duplicated n/d summary is collapsed like any other",
+      dispatch.strip_meta_commentary(ND_DOUBLED).count("**n/d | 424B2") == 1,
+      "an 'n/d' ticker used to slip past _HEADLINE_RE entirely")
+
+
+# ---------------------------------------------------------------------------
 # strip_reasoning — Nemotron 3 is a reasoning model. enable_thinking=false
 # should prevent chain-of-thought, but a leak would dump the model's
 # scratchpad into #sec-filings and eat the character budget.

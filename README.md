@@ -206,6 +206,14 @@ phrasing — and can only ever *promote*. `classify_priority()` reads the summar
 and can demote. One stops a miss the reader never learns about; the other stops
 a ping the reader cannot see the reason for.
 
+**Nothing without a headline is ever posted.** A completion has to open with
+`[emoji] **TICKER | FORM | YYYY-MM-DD**` on line 1, or it is the model
+narrating the task instead of doing it. A failing completion goes back through
+the fallback chain first; if every model fails, the channel gets a ⚠️ alert
+with the EDGAR link rather than the model's notes to itself. The check is
+anchored to the start of a line on purpose — the leaked post on 2026-09-01
+contained a perfectly well-formed headline quoted mid-sentence.
+
 **Routing reads the message that gets posted, not the model's raw output.**
 Those are not the same string: the dispatcher drops a second summary copy,
 strips the model's deliberation, and truncates to Discord's cap. Three
