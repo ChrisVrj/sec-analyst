@@ -294,6 +294,18 @@ An operating company (a manufacturer, bank, REIT, utility, insurer) has NO NAV. 
 **Use of proceeds:** paraphrase; if it names existing publicly traded securities to redeem, quote verbatim in the highlight block above
 **Change of control:** yes <terms> | no
 
+— RIGHTS OFFERING (CEF / BDC subscription rights; use with the 🧨 block above) —
+**Ratio:** one new share for every X rights held
+**Rights symbol:** "X.RT" on NYSE / NASDAQ — or "n/d"
+**Transferable:** yes | no
+**Subscription price:** the formula, e.g. 90% of NAV or 95% of the 5-day average market price, whichever is higher
+**Estimated price:** $XX.XX per share, if the filing gives one
+**Record date:** <date>
+**Expiration:** <date>
+**Shares offered:** X,XXX,XXX
+**Over-subscription privilege:** yes | no
+**NAV / market price at filing:** $XX.XX NAV, $XX.XX market
+
 — REDEMPTION / CALL —
 **Series:** ticker / name
 **Redemption price:** $XX.XX [+ accrued]
@@ -340,6 +352,7 @@ Never show your reasoning. Do not write notes to yourself, do not discuss these 
 == EMOJI GUIDE (the [EMOJI] at line 1) ==
 🚨 redemption / call of publicly traded security
 📢 new publicly listed issuance
+🧨 CEF / BDC rights offering (dilution)
 ⚠️ M&A / change of control / restructuring
 🔁 tender / exchange offer
 💰 distribution raise
@@ -894,9 +907,33 @@ def fit_to_budget(body: str, budget: int) -> str:
 # guidance; ... Re-evaluating: ...)" and then repeated the entire summary with
 # a different conclusion.
 _META_LINE_RE = re.compile(
-    r"^\s*(\(?Note:|Re-evaluating|Per strict interpretation|However, as\b|-{3,}\s*$)",
+    r"^\s*(\(?Note:|Re-evaluating|Per strict interpretation|However, as\b"
+    r"|Omit(ting)? (the )?highlight|No highlight block|-{3,}\s*$)",
     re.I,
 )
+
+# Vocabulary that exists only in SYSTEM_PROMPT. If it survives into the summary
+# the model is narrating the instructions instead of the filing — the PRU
+# InterNotes post on 2026-08-31 ended "...Omit highlight block — no priority-1
+# to -4 trigger is literally stated." in the middle of a paragraph, where a
+# line-anchored rule cannot reach it. Scrubbed sentence by sentence so the
+# surrounding analysis survives.
+_PROMPT_ECHO_RE = re.compile(
+    r"highlight block|priority[- ][1-7]\s*(to|through|-)"
+    r"|per (the )?(guidance|template|instructions)|output template",
+    re.I,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _drop_prompt_echo(line: str) -> str:
+    """Remove sentences that talk about the template instead of the filing."""
+    stripped = line.lstrip()
+    # Field lines, headers and verbatim quotes are structural — never touched.
+    if stripped.startswith(("**", "#", ">")) or not _PROMPT_ECHO_RE.search(line):
+        return line
+    kept = [p for p in _SENTENCE_SPLIT_RE.split(line) if not _PROMPT_ECHO_RE.search(p)]
+    return " ".join(kept).strip()
 # Line 1 of the template: [emoji] **TICKER | FORM | YYYY-MM-DD** — headline
 _HEADLINE_RE = re.compile(r"^.{0,4}\*\*[A-Z0-9.\-]{1,8}\s*\|", re.M)
 
@@ -914,22 +951,48 @@ def strip_meta_commentary(body: str) -> str:
     heads = list(_HEADLINE_RE.finditer(body))
     if len(heads) > 1:
         body = body[:heads[1].start()].rstrip()
-    return "\n".join(l for l in body.split("\n") if not _META_LINE_RE.match(l)).strip()
+    kept = [_drop_prompt_echo(l) for l in body.split("\n") if not _META_LINE_RE.match(l)]
+    # A line scrubbed down to nothing would otherwise leave a blank gap behind.
+    out, prev_blank = [], False
+    for line in kept:
+        blank = not line.strip()
+        if blank and prev_blank:
+            continue
+        out.append(line)
+        prev_blank = blank
+    return "\n".join(out).strip()
 
 
-def finalize_message(summary: str, filing: dict, prefix: str = "") -> str:
+def body_budget(filing: dict, prefix: str = "") -> int:
+    """Characters left for the body once the prefix and footer are paid for."""
+    footer = build_footer(filing)
+    head   = f"{prefix} " if prefix else ""
+    return MAX_DISCORD_CHARS - len(head) - (len(footer) + 2 if footer else 0)
+
+
+def render_body(summary: str, budget: int) -> str:
+    """Model output -> the exact text that will appear in Discord.
+
+    Split out of finalize_message() in Sep 2026 so routing can be decided on
+    THIS string rather than on the raw model output. See dispatch().
+    """
     body = _MODEL_FOOTER_RE.sub("", summary).strip()
     body = strip_meta_commentary(body)
     body = trim_long_lines(body)
+    return fit_to_budget(body, budget)
 
+
+def assemble_message(body: str, filing: dict, prefix: str = "") -> str:
     head   = f"{prefix} " if prefix else ""
     footer = build_footer(filing)
+    return f"{head}{body}\n\n{footer}" if footer else f"{head}{body}"
 
-    # The prefix and footer are both fixed costs; only the body flexes.
-    budget = MAX_DISCORD_CHARS - len(head) - (len(footer) + 2 if footer else 0)
-    fitted = fit_to_budget(body, budget)
 
-    return f"{head}{fitted}\n\n{footer}" if footer else f"{head}{fitted}"
+def finalize_message(summary: str, filing: dict, prefix: str = "") -> str:
+    """Kept as the one-shot form for callers that do not need to route."""
+    return assemble_message(
+        render_body(summary, body_budget(filing, prefix)), filing, prefix
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -995,7 +1058,22 @@ def dispatch(filing_path: Path) -> int:
         move_to_processed(filing_path, prefix="err_")
         return DEFAULT_SLEEP  # attempts were spent; rate-limit anyway
 
-    tier, priority_label = classify_priority(summary, form_type)
+    # Route on the body we are about to POST, never on the raw model output.
+    #
+    # Sep 2026: three Goldman / Prudential $1,000-par unlisted note supplements
+    # pinged #sec-urgent while the message Chris could see carried a 📋 lead
+    # emoji, no highlight block, and a body reading "Listing: UNLISTED /
+    # Par: $1,000" — text that classify_priority() scores as routine. Both
+    # things were true at once because the two ran on different strings:
+    # routing read the raw completion, and render_body() then dropped a second
+    # summary copy, stripped the model's deliberation, and truncated the tail.
+    # Whatever justified the ping lived in the part that never got posted.
+    #
+    # The budget reserves room for the mention before the tier is known, so
+    # the body is identical either way and a late routing decision can never
+    # re-truncate what was already classified.
+    body = render_body(summary, body_budget(filing, DISCORD_URGENT_MENTION))
+    tier, priority_label = classify_priority(body, form_type)
 
     # The filing gets a vote of its own. classify_priority reads the model's
     # wording, which is fine until the model describes the event correctly and
@@ -1004,6 +1082,11 @@ def dispatch(filing_path: Path) -> int:
     # read until Monday. triage_filing reads form_type and filing_text, which
     # do not vary with phrasing. It can only promote: whichever source calls
     # it more urgent wins.
+    #
+    # The two guards pull in opposite directions on purpose. Reading the
+    # posted body stops a ping the reader cannot see the reason for; reading
+    # the filing stops a miss the reader never learns about. Neither one
+    # weakens the other, because this can only ever promote.
     det_tier, det_label, det_notes = triage_filing(
         form_type, filing.get("filing_text", ""), filing.get("entity_name", ""))
     if det_tier and (tier == 0 or det_tier < tier):
@@ -1020,7 +1103,7 @@ def dispatch(filing_path: Path) -> int:
 
     prefix  = DISCORD_URGENT_MENTION if (is_urgent and DISCORD_URGENT_MENTION) else ""
     webhook = DISCORD_WEBHOOK_URGENT if (is_urgent and DISCORD_WEBHOOK_URGENT) else ""
-    message = finalize_message(summary, filing, prefix=prefix)
+    message = assemble_message(body, filing, prefix=prefix)
 
     if is_urgent:
         log.info(

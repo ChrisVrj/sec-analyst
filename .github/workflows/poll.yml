@@ -1,10 +1,10 @@
 name: EDGAR SEC Poller
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GOAL: continuous coverage during the trading windows — every filing fetched,
-# summarized and posted within seconds, with no gaps to fall through.
+# GOAL: every watchlist filing reaches Discord. Within seconds when a runner is
+# live; within one cron trigger when it is not. Never "not at all".
 #
-# HOW THE THREE PIECES FIT TOGETHER
+# HOW THE FOUR PIECES FIT TOGETHER
 #
 # 1. cron '*/5 * * * *' — fires every 5 minutes, 24/7.
 #    NOT because we want a run every 5 minutes, but because GitHub throttles
@@ -16,46 +16,51 @@ name: EDGAR SEC Poller
 # 2. concurrency (cancel-in-progress: false) — GitHub allows at most one
 #    RUNNING plus one PENDING run per group; each new trigger replaces the
 #    pending one. That gives two things for free:
-#      · the */5 ticks during a window can't pile up or double-post
-#      · a pending run is always parked, so if the long run dies the
-#        replacement starts within seconds of the failure, not 5 minutes
+#      · the */5 ticks during a session can't pile up or double-post
+#      · a pending run is always parked, so when the long run reaches its 6h
+#        ceiling the next one starts within seconds, not at the next trigger
 #
 #    EXPECTED SIDE EFFECT: while a long run is live, each */5 tick replaces
 #    the parked pending run, so the Actions tab fills with "cancelled" runs
-#    that never executed a step — roughly 60 per day window. This is the
-#    mechanism working, not a fault. The run that matters is the single
-#    long-lived one; sort by duration to find it.
+#    that never executed a step. This is the mechanism working, not a fault.
+#    The run that matters is the single long-lived one; sort by duration.
 #
-# 3. The job runs ONE LONG LOOP to the end of the current window rather than
-#    a fixed 4 minutes. GitHub's job ceiling is 6h; the longest window is 5h.
-#    This is what removes the inter-run gaps entirely — previously every run
-#    boundary cost ~30s of blindness, plus GitHub's scheduling jitter.
+# 3. The job runs ONE LONG LOOP to the end of the session rather than a fixed
+#    few minutes. GitHub's job ceiling is 6h and the session is 16h, so a full
+#    session is two or three chained jobs — but every run boundary inside a
+#    job is gone, along with GitHub's scheduling jitter.
 #
-# TRADING WINDOWS (Sofia local — tzdata handles EEST/EET, nothing to edit
-# at the DST switch):
-#   Day   : 13:00 – 18:00   Mon–Fri   = 06:00 – 11:00 ET
-#   Night : 23:00 – 03:00   Mon–Fri evenings = 16:00 – 20:00 ET
-#                                     (runs into the next calendar day)
+# 4. EVERY RUN STARTS WITH A CATCH-UP SWEEP, in or out of the session. This is
+#    the piece that makes the cron cadence survivable — see below.
 #
-# Both windows sit entirely inside EDGAR's filing hours (06:00–22:00 ET), so
-# no cycle is wasted. The day window opens at 13:00 Sofia precisely because
-# that is 06:00 ET — EDGAR's first filing minute — in both aligned DST
-# regimes. It was 11:00–16:00 until Aug 2026, which spent its first two hours
-# polling a system that was not yet accepting filings.
+# THE SESSION (Sofia local — tzdata handles EEST/EET, nothing to edit at the
+# DST switch):
 #
-# During the 2–3 weeks each spring/autumn when US and EU clocks are out of
+#   13:00 Sofia → 05:00 Sofia next day, Mon-Fri  =  06:00 - 22:00 ET
+#
+# That is EDGAR's filing day end to end: 06:00 ET is its first filing minute,
+# 22:00 ET its last. There is no longer a gap in the middle.
+#
+# ⚠ WHY THE OLD TWO-WINDOW SCHEDULE WAS REPLACED (Sep 2026). It ran
+# 06:00-11:00 and 16:00-20:00 ET and left 11:00-16:00 ET — five hours across
+# the middle of the US session — with no coverage at all. Nuveen's NMCO rights
+# offering (497AD, 0001999371-26-018939) was filed at 13:51 ET on 2026-08-27,
+# inside that hole. A cron trigger landed at 13:51 ET that day, evaluated the
+# windows, found itself between them, and exited after six seconds.
+#
+# During the 2-3 weeks each spring/autumn when US and EU clocks are out of
 # step, Sofia 13:00 lands on 07:00 ET instead of 06:00 — still live, just an
 # hour later. Not worth compensating for.
 #
-# COST: public repo = unlimited Actions minutes. ~9h/weekday of runtime is
-# free. SEC sees ~1 feed request per 15s (0.07 req/s against their 10 req/s
-# limit). NVIDIA sees at most 30 req/min against a ~40 req/min free ceiling.
+# COST: public repo = unlimited Actions minutes. SEC sees ~3 feed requests per
+# 15s poll (0.2 req/s against their 10 req/s limit). NVIDIA sees at most 30
+# req/min against a ~40 req/min free ceiling.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # keeps the scheduler warm; window check does the real gating
-  workflow_dispatch:         # manual trigger — bypasses the window, capped at 10 min
+    - cron: '*/5 * * * *'   # keeps the scheduler warm; the step below gates
+  workflow_dispatch:         # manual trigger — bypasses the session, capped at 10 min
 
 concurrency:
   group: edgar-poller
@@ -67,8 +72,8 @@ jobs:
     timeout-minutes: 350     # 5h45m of wait+polling, plus setup; ceiling is 6h
 
     steps:
-      # ── 1. Which window are we in, and how long should this job live? ─────
-      - name: Check trading window
+      # ── 1. Are we in the session, and how long should this job live? ──────
+      - name: Check trading session
         id: window
         run: |
           # Everything is computed in Sofia local time, so EEST/EET is handled
@@ -81,116 +86,130 @@ jobs:
           echo "Sofia $(TZ=Europe/Sofia date '+%H:%M %a') (UTC$SOFIA_OFFSET)  dow=$SOFIA_DOW  min=$SOFIA_MIN"
 
           # Guard: if the runner ever loses tzdata, TZ= silently yields UTC and
-          # every window would shift 2-3 hours. Make that loud, not silent.
+          # the session would shift 2-3 hours. Make that loud, not silent.
           case "$SOFIA_OFFSET" in
             +0300|+0200) ;;
-            *) echo "::warning title=Sofia timezone lookup failed::Offset '$SOFIA_OFFSET' is neither +0300 nor +0200 — tzdata missing? Window boundaries are unreliable." ;;
+            *) echo "::warning title=Sofia timezone lookup failed::Offset '$SOFIA_OFFSET' is neither +0300 nor +0200 — tzdata missing? Session boundaries are unreliable." ;;
           esac
 
-          # Window bounds in Sofia minutes-past-midnight.
-          DAY_START=780     # 13:00 Sofia = 06:00 ET, EDGAR's first filing minute
-          DAY_END=1080      # 18:00 Sofia = 11:00 ET
-          NIGHT_START=1380  # 23:00 Sofia = 16:00 ET
-          NIGHT_END=180     # 03:00 Sofia = 20:00 ET, the following day
+          # Session bounds in Sofia minutes-past-midnight.
+          SESSION_START=780   # 13:00 Sofia = 06:00 ET, EDGAR's first filing minute
+          SESSION_END=300     # 05:00 Sofia = 22:00 ET, EDGAR's last, next day
 
           # Budget. A job may run 6h; leave headroom for checkout/setup/upload.
           MAX_WAIT_SECONDS=7200      # 2h — longest we'll idle waiting to open
           MAX_TOTAL_SECONDS=20700    # 5h45m of wait + polling combined
           MIN_USEFUL_SECONDS=1800    # don't bother waiting for <30 min of polling
 
-          PROCEED=false
+          MODE="skip"
           WINDOW="none"
           END_MIN=0
           WAIT_MIN=0
           WIN_LEN_MIN=0
 
+          # ── Is a live poller wanted right now? ───────────────────────────
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             # Manual test: run regardless of the clock, but only briefly — a
             # manual run must not hold the concurrency slot for five hours.
             WINDOW="manual"
-            PROCEED=true
+            MODE="live"
             END_MIN=$(( SOFIA_MIN + 10 ))
 
-          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -ge "$DAY_START" ] && [ "$SOFIA_MIN" -lt "$DAY_END" ]; then
-            WINDOW="day 13:00-18:00"
-            PROCEED=true
-            END_MIN=$DAY_END
+          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -ge "$SESSION_START" ]; then
+            # Evening-side of the session. Run straight through midnight to
+            # 05:00 so one job covers as much of it as its 6h ceiling allows.
+            WINDOW="session 13:00-05:00"
+            MODE="live"
+            END_MIN=$(( 1440 + SESSION_END ))
 
-          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -ge "$NIGHT_START" ]; then
-            # Evening half of the night window. Run straight through midnight
-            # to 03:00 so the session is covered by a single job: 1440 + 180.
-            WINDOW="night 23:00-03:00"
-            PROCEED=true
-            END_MIN=$(( 1440 + NIGHT_END ))
+          elif [ "$SOFIA_DOW" -ge 2 ] && [ "$SOFIA_DOW" -le 6 ] && [ "$SOFIA_MIN" -lt "$SESSION_END" ]; then
+            # After-midnight half. Valid Tue-Sat because it belongs to the
+            # PRECEDING weekday's session — Sat 00:00-05:00 is Friday's US
+            # after-hours and is wanted; Mon 00:00-05:00 is Sunday's and is not.
+            WINDOW="session 13:00-05:00 (past midnight)"
+            MODE="live"
+            END_MIN=$SESSION_END
 
-          elif [ "$SOFIA_DOW" -ge 2 ] && [ "$SOFIA_DOW" -le 6 ] && [ "$SOFIA_MIN" -lt "$NIGHT_END" ]; then
-            # After-midnight half. Valid Tue–Sat because it belongs to the
-            # PRECEDING weekday's evening — Sat 00:00-03:00 is Friday's US
-            # after-hours session and is wanted; Mon 00:00-03:00 is Sunday's
-            # and is not.
-            WINDOW="night 23:00-03:00 (past midnight)"
-            PROCEED=true
-            END_MIN=$NIGHT_END
-
-          # ── Pre-window arming ────────────────────────────────────────────
+          # ── Pre-session arming ───────────────────────────────────────────
           # GitHub does NOT honour the */5 cron: measured trigger cadence is
-          # 1.5-3 HOURS (run numbers are consecutive across the gaps, so the
-          # runs are never created at all). A window is therefore covered only
-          # if a trigger happens to land inside it. On 2026-08-06 none landed
-          # between 21:39 and 03:27 and the entire night window was missed.
+          # 1.5-3 HOURS routinely and up to 11 HOURS in a bad stretch (run
+          # numbers are consecutive across the gaps, so the runs are never
+          # created at all). On 2026-08-28 nothing was created between 16:23
+          # and 02:05 Sofia, so RiverNorth's RIV rights offering — filed at
+          # 16:52 ET, inside the old night window — had no runner listening.
           #
-          # So when a trigger lands shortly BEFORE a window, hold the runner
-          # and open with the window instead of exiting and hoping for another
-          # trigger that may never come. With a 2h look-ahead against a ~2h
-          # observed cadence, essentially every window gets armed.
-          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -lt "$DAY_START" ]; then
-            WINDOW="day 13:00-18:00 (armed early)"
-            PROCEED=true
-            WAIT_MIN=$(( DAY_START - SOFIA_MIN ))
-            WIN_LEN_MIN=$(( DAY_END - DAY_START ))
-
-          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -lt "$NIGHT_START" ]; then
-            WINDOW="night 23:00-03:00 (armed early)"
-            PROCEED=true
-            WAIT_MIN=$(( NIGHT_START - SOFIA_MIN ))
-            WIN_LEN_MIN=$(( 1440 + NIGHT_END - NIGHT_START ))
-
-          else
-            echo "Outside trading windows, and no window opens soon — skipping."
+          # So when a trigger lands shortly BEFORE the session, hold the runner
+          # and open with it rather than exiting and hoping for another trigger
+          # that may never come.
+          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -lt "$SESSION_START" ]; then
+            WINDOW="session 13:00-05:00 (armed early)"
+            MODE="live"
+            WAIT_MIN=$(( SESSION_START - SOFIA_MIN ))
+            WIN_LEN_MIN=$(( 1440 + SESSION_END - SESSION_START ))
           fi
 
           WAIT_SECONDS=$(( WAIT_MIN * 60 ))
           RUN_SECONDS=0
 
-          if [ "$PROCEED" = "true" ] && [ "$WAIT_MIN" -gt 0 ]; then
+          # Monday before the open is the one pre-session slot with nothing
+          # behind it — the last session ended Saturday 05:00 Sofia, further
+          # back than any catch-up horizon reaches. Every other weekday's
+          # pre-session hours sit right after the previous night's close.
+          TOO_FAR_MODE="catchup"
+          [ "$SOFIA_DOW" -eq 1 ] && TOO_FAR_MODE="skip"
+
+          if [ "$MODE" = "live" ] && [ "$WAIT_MIN" -gt 0 ]; then
             if [ "$WAIT_SECONDS" -gt "$MAX_WAIT_SECONDS" ]; then
-              echo "Next window opens in ${WAIT_MIN} min — beyond the $(( MAX_WAIT_SECONDS / 60 )) min look-ahead, skipping."
-              PROCEED=false
+              echo "Session opens in ${WAIT_MIN} min — beyond the $(( MAX_WAIT_SECONDS / 60 )) min look-ahead."
+              MODE="$TOO_FAR_MODE"
               WAIT_SECONDS=0
             else
               RUN_SECONDS=$(( MAX_TOTAL_SECONDS - WAIT_SECONDS ))
               [ "$RUN_SECONDS" -gt $(( WIN_LEN_MIN * 60 )) ] && RUN_SECONDS=$(( WIN_LEN_MIN * 60 ))
               if [ "$RUN_SECONDS" -lt "$MIN_USEFUL_SECONDS" ]; then
-                echo "Only ${RUN_SECONDS}s of polling would fit after the wait — skipping."
-                PROCEED=false
+                echo "Only ${RUN_SECONDS}s of polling would fit after the wait."
+                MODE="$TOO_FAR_MODE"
                 WAIT_SECONDS=0
                 RUN_SECONDS=0
               else
-                echo "Window: $WINDOW — idling ${WAIT_MIN} min, then polling for $(( RUN_SECONDS / 60 )) min."
+                echo "Session: $WINDOW — idling ${WAIT_MIN} min, then polling for $(( RUN_SECONDS / 60 )) min."
               fi
             fi
 
-          elif [ "$PROCEED" = "true" ]; then
+          elif [ "$MODE" = "live" ]; then
             RUN_SECONDS=$(( (END_MIN - SOFIA_MIN) * 60 ))
             # Clamp: never negative (clock races at a boundary), never beyond
             # the job timeout.
             [ "$RUN_SECONDS" -lt 60 ] && RUN_SECONDS=60
             [ "$RUN_SECONDS" -gt "$MAX_TOTAL_SECONDS" ] && RUN_SECONDS=$MAX_TOTAL_SECONDS
-            echo "Window: $WINDOW — polling for $(( RUN_SECONDS / 60 )) min (until Sofia $(( END_MIN / 60 % 24 )):$(printf '%02d' $(( END_MIN % 60 ))))"
+            echo "Session: $WINDOW — polling for $(( RUN_SECONDS / 60 )) min (until Sofia $(( END_MIN / 60 % 24 )):$(printf '%02d' $(( END_MIN % 60 ))))"
           fi
 
+          # ── Is a catch-up sweep worth running? ───────────────────────────
+          # Yes whenever EDGAR could have been open behind us. The session runs
+          # Sofia 13:00 Mon through Sofia 05:00 Sat, so anything from Monday
+          # afternoon to Saturday can have unrecovered filings behind it.
+          # Sunday, and Monday before the open, cannot.
+          #
+          # This is what makes a stray trigger useful instead of wasted. The
+          # 13:51 ET trigger on 2026-08-27 that exited in six seconds would
+          # have delivered NMCO's rights offering had this step existed.
+          if [ "$MODE" != "skip" ]; then
+            CATCHUP=true
+          elif [ "$SOFIA_DOW" -ge 2 ] && [ "$SOFIA_DOW" -le 6 ]; then
+            CATCHUP=true
+            MODE="catchup"
+          else
+            CATCHUP=false
+            echo "Sunday, or Monday before the open — nothing can be behind us. Skipping."
+          fi
+
+          echo "Mode: $MODE (catch-up sweep: $CATCHUP)"
+
           {
-            echo "proceed=$PROCEED"
+            echo "mode=$MODE"
+            echo "catchup=$CATCHUP"
+            echo "live=$([ "$MODE" = "live" ] && echo true || echo false)"
             echo "wait_seconds=$WAIT_SECONDS"
             echo "run_seconds=$RUN_SECONDS"
             echo "window=$WINDOW"
@@ -198,24 +217,24 @@ jobs:
 
       # ── 2. Checkout ────────────────────────────────────────────────────────
       - name: Checkout
-        if: steps.window.outputs.proceed == 'true'
+        if: steps.window.outputs.mode != 'skip'
         uses: actions/checkout@v4
 
       # ── 3. Python ──────────────────────────────────────────────────────────
       - name: Set up Python
-        if: steps.window.outputs.proceed == 'true'
+        if: steps.window.outputs.mode != 'skip'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       # ── 4. Restore caches ──────────────────────────────────────────────────
       #  NOTE: actions/cache only writes in its post-job step, so with a
-      #  window-length job this state is persisted once, at the end. If the job
-      #  is killed mid-window the state is lost — but the blast radius is
-      #  bounded, because the poller only ever sees EDGAR's last-100-filings
-      #  feed, so at worst a couple of recent filings get re-posted.
+      #  session-length job this state is persisted once, at the end. If the
+      #  job is killed mid-session that state is lost — the catch-up sweep on
+      #  the next run then re-reads the feed with an empty `seen` set, which is
+      #  exactly the cold start --max-queue exists to bound.
       - name: Restore seen accessions cache
-        if: steps.window.outputs.proceed == 'true'
+        if: steps.window.outputs.mode != 'skip'
         uses: actions/cache@v4
         with:
           path: seen_accessions.json
@@ -224,7 +243,7 @@ jobs:
             seen-accessions-
 
       - name: Restore dispatched accessions cache
-        if: steps.window.outputs.proceed == 'true'
+        if: steps.window.outputs.mode != 'skip'
         uses: actions/cache@v4
         with:
           path: dispatched_accessions.json
@@ -232,14 +251,48 @@ jobs:
           restore-keys: |
             dispatched-accessions-
 
-      # ── 5. Poll + dispatch, continuously, until the window closes ──────────
+      # ── 5. Catch-up sweep — recover anything filed while nobody listened ───
+      #
+      # EDGAR's current-filings feed pages backwards with `start`, so a run can
+      # read its way back through a blackout instead of seeing only the newest
+      # 100 entries. That matters more than it sounds: at the 17:20-17:30 ET
+      # deadline rush one page spans five and a half minutes, so the feed alone
+      # remembers almost nothing. Every filing missed on 2026-08-27/28 was
+      # still reachable this way hours later.
+      #
+      # Runs BEFORE the live loop and independently of it, so a trigger that
+      # lands outside the session still delivers.
+      - name: Catch-up sweep
+        if: steps.window.outputs.catchup == 'true'
+        run: |
+          python edgar_poller.py --catchup
+
+          COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "──── Catch-up recovered $COUNT filing(s), dispatching ────"
+            python openrouter_dispatch.py
+          else
+            echo "Catch-up found nothing missing."
+          fi
+        env:
+          GITHUB_WORKSPACE:       ${{ github.workspace }}
+          DISCORD_WEBHOOK:        ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_URGENT: ${{ secrets.DISCORD_WEBHOOK_URGENT }}
+          DISCORD_URGENT_MENTION: ${{ vars.DISCORD_URGENT_MENTION }}
+          NVIDIA_API_KEY:         ${{ secrets.NVIDIA_API_KEY }}
+          OPENROUTER_API_KEY:     ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_MODELS:          ${{ vars.NVIDIA_MODELS }}
+          OPENROUTER_MODEL:       ${{ vars.OPENROUTER_MODEL }}
+
+      # ── 6. Poll + dispatch, continuously, until the session closes ─────────
       - name: Poll and dispatch loop
-        if: steps.window.outputs.proceed == 'true'
+        if: steps.window.outputs.live == 'true'
         run: |
           POLL_SECONDS=15
+          SWEEP_EVERY=20          # poll cycles between mid-session catch-up sweeps
           WAIT_SECONDS=${{ steps.window.outputs.wait_seconds }}
 
-          # Armed early: hold until the window actually opens. Progress is
+          # Armed early: hold until the session actually opens. Progress is
           # echoed so a silent multi-hour step isn't mistaken for a hang.
           if [ "$WAIT_SECONDS" -gt 0 ]; then
             OPEN_AT=$(( $(date +%s) + WAIT_SECONDS ))
@@ -247,22 +300,31 @@ jobs:
             while [ "$(date +%s)" -lt "$OPEN_AT" ]; do
               LEFT=$(( OPEN_AT - $(date +%s) ))
               [ "$LEFT" -le 0 ] && break
-              echo "  … ${LEFT}s until the window opens (Sofia $(TZ=Europe/Sofia date '+%H:%M'))"
+              echo "  … ${LEFT}s until the session opens (Sofia $(TZ=Europe/Sofia date '+%H:%M'))"
               [ "$LEFT" -gt 300 ] && sleep 300 || sleep "$LEFT"
             done
-            echo "Window open."
+            echo "Session open."
           fi
 
           END_TIME=$(( $(date +%s) + ${{ steps.window.outputs.run_seconds }} ))
           POLL=0
           POSTED=0
 
-          echo "Window '${{ steps.window.outputs.window }}' — polling every ${POLL_SECONDS}s until $(date -u -d "@$END_TIME" '+%H:%M:%S UTC')"
+          echo "Session '${{ steps.window.outputs.window }}' — polling every ${POLL_SECONDS}s until $(date -u -d "@$END_TIME" '+%H:%M:%S UTC')"
 
           while [ "$(date +%s)" -lt "$END_TIME" ]; do
             POLL=$(( POLL + 1 ))
 
-            python edgar_poller.py --once
+            # Every SWEEP_EVERY cycles, re-read deeper than a live poll does.
+            # A dispatch cycle can take minutes (LLM latency x N filings) and
+            # the feed's newest page covers under six minutes at peak, so a
+            # busy patch can outrun the live read. This heals that in place
+            # rather than waiting for the next run.
+            if [ $(( POLL % SWEEP_EVERY )) -eq 0 ]; then
+              python edgar_poller.py --catchup --catchup-hours 1 --max-pages 12
+            else
+              python edgar_poller.py --once
+            fi
 
             COUNT=$(find filings-inbox -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
             if [ "$COUNT" -gt 0 ]; then
@@ -281,7 +343,7 @@ jobs:
             fi
           done
 
-          echo "Window closed after $POLL poll(s); $POSTED filing(s) entered the dispatcher."
+          echo "Session closed after $POLL poll(s); $POSTED filing(s) entered the dispatcher."
         env:
           GITHUB_WORKSPACE:   ${{ github.workspace }}
           DISCORD_WEBHOOK:    ${{ secrets.DISCORD_WEBHOOK }}
@@ -305,9 +367,9 @@ jobs:
           NVIDIA_MODELS:      ${{ vars.NVIDIA_MODELS }}
           OPENROUTER_MODEL:   ${{ vars.OPENROUTER_MODEL }}
 
-      # ── 6. Upload logs (always, even on failure) ───────────────────────────
+      # ── 7. Upload logs (always, even on failure) ───────────────────────────
       - name: Upload logs
-        if: steps.window.outputs.proceed == 'true' && always()
+        if: steps.window.outputs.mode != 'skip' && always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ github.run_id }}

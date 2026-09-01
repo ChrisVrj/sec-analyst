@@ -3,9 +3,13 @@
 EDGAR poller for the OpenClaw sec-analyst pipeline.
 
 Modes:
-  --once    Poll EDGAR once, write matched filings to filings-inbox/, exit.
-            Used by GitHub Actions.
-  (default) Poll continuously (original local dev behavior).
+  --once     Poll EDGAR once, write matched filings to filings-inbox/, exit.
+             Used by GitHub Actions inside a trading window.
+  --catchup  Sweep back through the feed to a time horizon and queue anything
+             on the watchlist that was never seen. Used at the start of every
+             Actions run, in or out of a window, so a gap in GitHub's cron
+             costs latency rather than the filing.
+  (default)  Poll continuously (original local dev behavior).
 
 Matched filings are written as JSON files to INBOX_DIR.
 openrouter_dispatch.py reads them in the same GitHub Actions job.
@@ -41,6 +45,28 @@ INBOX_DIR      = BASE_DIR / "filings-inbox"
 LOG_FILE       = BASE_DIR / "edgar_poller.log"
 
 MAX_SEEN = 10_000   # cap memory of seen accessions
+
+# EDGAR's current-filings feed caps `count` at 100 ENTRIES per page — asking
+# for 200 or 400 silently returns 100 — but `start` pages backwards without
+# limit, at least to the previous session's open. Two facts about that page,
+# both measured on 2026-09-01, drive the numbers below:
+#
+#   · 100 entries is NOT 100 filings. Ownership and beneficial-ownership forms
+#     emit one entry per role (Reporting + Issuer, Filed by + Subject), so a
+#     page holds ~50 unique accessions on a quiet evening.
+#   · At the 17:20-17:30 ET deadline rush a page spans FIVE AND A HALF
+#     MINUTES. Page 0 alone is not a safety margin; it is barely a buffer
+#     against one slow dispatch cycle.
+#
+# So a live poll reads a few pages, and the catch-up sweep reads as many as it
+# needs to reach its horizon. At 3 pages per 15s poll that is 0.2 req/s
+# against SEC's 10 req/s fair-access limit.
+FEED_PAGE_SIZE   = 100
+FEED_PAGE_SLEEP  = 0.25   # between pages, well inside SEC fair access
+LIVE_PAGES       = 3      # ~17 min of depth at peak, ~7 h on a quiet evening
+CATCHUP_PAGES    = 40     # ceiling; the horizon normally stops it far sooner
+CATCHUP_HOURS    = 8      # covers the longest observed cron gap plus slack
+CATCHUP_MAX_QUEUE = 40    # cold-start guard, see poll_once()
 
 # ---------------------------------------------------------------------------
 # Federal holidays (EDGAR closed)
@@ -152,11 +178,44 @@ def load_watchlist() -> dict[str, str]:
 # EDGAR feed fetch
 # ---------------------------------------------------------------------------
 
-def fetch_recent_filings() -> list[dict]:
-    """Fetch the 100-entry global EDGAR current filings Atom feed."""
+def _parse_feed_entry(entry, ns: dict) -> dict:
+    link    = entry.find("a:link", ns)
+    title   = entry.find("a:title", ns)
+    updated = entry.find("a:updated", ns)
+
+    href       = link.attrib.get("href", "") if link is not None else ""
+    title_text = title.text or ""
+    updated_at = (updated.text or "") if updated is not None else ""
+
+    accession = ""
+    cik       = ""
+
+    if "-index.htm" in href:
+        parts     = href.rstrip("/").split("/")
+        accession = parts[-1].replace("-index.htm", "")
+        cik       = parts[-3] if len(parts) >= 3 else ""
+
+    form_type   = title_text.split(" - ")[0].strip() if " - " in title_text else ""
+    entity_part = title_text.split(" - ", 1)[1]      if " - " in title_text else title_text
+    entity_name = entity_part.rsplit("(", 1)[0].strip()
+
+    return {
+        "accession":   accession,
+        "cik":         cik.lstrip("0"),
+        "entity_name": entity_name.upper(),
+        "form_type":   form_type,
+        "file_date":   updated_at[:10],
+        "index_url":   href,
+        "updated":     updated_at,
+    }
+
+
+def _fetch_feed_page(start: int) -> list[dict]:
+    """One page of the global EDGAR current-filings Atom feed."""
     url = (
         "https://www.sec.gov/cgi-bin/browse-edgar"
-        "?action=getcurrent&type=&dateb=&owner=include&count=100&output=atom"
+        "?action=getcurrent&type=&dateb=&owner=include&output=atom"
+        f"&count={FEED_PAGE_SIZE}&start={start}"
     )
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
@@ -164,40 +223,68 @@ def fetch_recent_filings() -> list[dict]:
         with urllib.request.urlopen(req, timeout=20) as resp:
             root = ET.fromstring(resp.read())
     except Exception as e:
-        log.error(f"EDGAR RSS fetch failed: {e}")
+        log.error(f"EDGAR RSS fetch failed at start={start}: {e}")
         return []
 
     ns = {"a": "http://www.w3.org/2005/Atom"}
-    hits = []
+    return [_parse_feed_entry(e, ns) for e in root.findall("a:entry", ns)]
 
-    for entry in root.findall("a:entry", ns):
-        link    = entry.find("a:link", ns)
-        title   = entry.find("a:title", ns)
-        updated = entry.find("a:updated", ns)
 
-        href       = link.attrib.get("href", "") if link is not None else ""
-        title_text = title.text or ""
+def _entry_time(hit: dict) -> datetime.datetime | None:
+    raw = hit.get("updated") or ""
+    try:
+        return datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
 
-        accession = ""
-        cik       = ""
 
-        if "-index.htm" in href:
-            parts     = href.rstrip("/").split("/")
-            accession = parts[-1].replace("-index.htm", "")
-            cik       = parts[-3] if len(parts) >= 3 else ""
+def fetch_recent_filings(
+    max_pages: int = 1,
+    since: datetime.datetime | None = None,
+) -> list[dict]:
+    """Walk the current-filings feed, newest first, deduplicated by accession.
 
-        form_type   = title_text.split(" - ")[0].strip() if " - " in title_text else ""
-        entity_part = title_text.split(" - ", 1)[1]      if " - " in title_text else title_text
-        entity_name = entity_part.rsplit("(", 1)[0].strip()
+    Stops at whichever comes first: `max_pages`, an empty page, or a page
+    whose oldest entry predates `since`. The dedupe is not cosmetic — the feed
+    emits one entry per ROLE, so a page of 100 entries carries roughly half
+    that many filings and the old single-page read had half the depth it
+    appeared to have.
+    """
+    hits: list[dict] = []
+    seen_accessions: set[str] = set()
+    entries_read = 0
 
-        hits.append({
-            "accession":  accession,
-            "cik":        cik.lstrip("0"),
-            "entity_name": entity_name.upper(),
-            "form_type":  form_type,
-            "file_date":  (updated.text or "")[:10] if updated is not None else "",
-            "index_url":  href,
-        })
+    for page in range(max_pages):
+        entries = _fetch_feed_page(page * FEED_PAGE_SIZE)
+        if not entries:
+            break
+        entries_read += len(entries)
+
+        oldest = None
+        for hit in entries:
+            acc = hit["accession"]
+            if acc and acc not in seen_accessions:
+                seen_accessions.add(acc)
+                hits.append(hit)
+            ts = _entry_time(hit)
+            if ts and (oldest is None or ts < oldest):
+                oldest = ts
+
+        if since and oldest and oldest < since:
+            break
+        if page + 1 < max_pages:
+            time.sleep(FEED_PAGE_SLEEP)
+
+    if max_pages > 1:
+        span = ""
+        if hits:
+            newest, tail = _entry_time(hits[0]), _entry_time(hits[-1])
+            if newest and tail:
+                span = f" spanning {newest:%H:%M} back to {tail:%H:%M} ET"
+        log.info(
+            f"Feed: {entries_read} entries over {min(max_pages, (entries_read + 99) // 100)} "
+            f"page(s) -> {len(hits)} unique filing(s){span}"
+        )
 
     return hits
 
@@ -381,17 +468,30 @@ def write_filing_payload(
 # One poll cycle
 # ---------------------------------------------------------------------------
 
-def poll_once(seen: set[str], watchlist: dict[str, str]) -> tuple[set[str], int]:
+def poll_once(
+    seen: set[str],
+    watchlist: dict[str, str],
+    max_pages: int = 1,
+    since: datetime.datetime | None = None,
+    max_queue: int | None = None,
+) -> tuple[set[str], int]:
     """
     Run one poll cycle.
     Returns (updated_seen, number_of_new_filings_queued).
+
+    `max_queue` is a cold-start guard for the catch-up sweep. If the cache was
+    lost, `seen` is empty and an 8-hour sweep would otherwise hand the
+    dispatcher every watchlist filing of the day at once. The newest
+    `max_queue` are kept — they are the ones still worth acting on — and the
+    rest are marked seen so the next cycle starts clean.
     """
-    hits = fetch_recent_filings()
+    hits = fetch_recent_filings(max_pages=max_pages, since=since)
     if not hits:
         log.warning("Empty response from EDGAR feed")
         return seen, 0
 
     queued = 0
+    over_cap: list[str] = []
 
     for hit in hits:
         accession = hit["accession"]
@@ -404,8 +504,14 @@ def poll_once(seen: set[str], watchlist: dict[str, str]) -> tuple[set[str], int]
             seen.add(accession)   # mark as seen so we don't re-check next cycle
             continue
 
-        ticker                  = watchlist.get(cik, "UNKNOWN")
-        filing_text, doc_urls   = fetch_filing_documents(accession, cik)
+        ticker = watchlist.get(cik, "UNKNOWN")
+
+        if max_queue is not None and queued >= max_queue:
+            seen.add(accession)
+            over_cap.append(f"{ticker} {hit['form_type']} {accession}")
+            continue
+
+        filing_text, doc_urls = fetch_filing_documents(accession, cik)
 
         seen.add(accession)
 
@@ -425,6 +531,20 @@ def poll_once(seen: set[str], watchlist: dict[str, str]) -> tuple[set[str], int]
 
         save_seen(seen)
 
+    if over_cap:
+        # Named, not counted. This module's failure mode is silence, and a
+        # filing dropped by the cap is exactly the shape of thing that goes
+        # unnoticed for a week — so put every one of them in the log where a
+        # search for a ticker will find it.
+        log.warning(
+            f"Queue cap ({max_queue}) reached — {len(over_cap)} older watchlist "
+            f"filing(s) marked seen WITHOUT dispatch:"
+        )
+        for item in over_cap:
+            log.warning(f"    not dispatched: {item}")
+        log.warning("Raise --max-queue if this was not a cold start.")
+
+    save_seen(seen)
     return seen, queued
 
 
@@ -439,11 +559,48 @@ def main() -> None:
         action="store_true",
         help="Poll once and exit (GitHub Actions mode)",
     )
+    parser.add_argument(
+        "--catchup",
+        action="store_true",
+        help="Sweep back to --catchup-hours and queue anything never seen, "
+             "then exit. Runs whether or not EDGAR is open.",
+    )
+    parser.add_argument("--catchup-hours", type=float, default=CATCHUP_HOURS,
+                        help=f"catch-up horizon in hours (default {CATCHUP_HOURS})")
+    parser.add_argument("--max-pages", type=int, default=CATCHUP_PAGES,
+                        help=f"page ceiling for a catch-up sweep (default {CATCHUP_PAGES})")
+    parser.add_argument("--pages", type=int, default=LIVE_PAGES,
+                        help=f"feed pages per live poll (default {LIVE_PAGES})")
+    parser.add_argument("--max-queue", type=int, default=CATCHUP_MAX_QUEUE,
+                        help=f"cold-start queue cap for a catch-up sweep "
+                             f"(default {CATCHUP_MAX_QUEUE})")
     args = parser.parse_args()
 
     seen      = load_seen()
     watchlist = load_watchlist()
     log.info(f"Loaded {len(seen)} seen accessions | {len(watchlist)} watchlist CIKs")
+
+    if args.catchup:
+        # Deliberately NOT gated on edgar_is_open(). The whole point is to run
+        # after a blackout, and the most valuable moment to run is the first
+        # trigger after EDGAR closes — that is when the day's tail is still
+        # unrecovered. Nothing new appears while EDGAR is shut, so a sweep
+        # outside filing hours is cheap and occasionally decisive.
+        horizon = datetime.datetime.now(ET_ZONE) - datetime.timedelta(
+            hours=args.catchup_hours
+        )
+        log.info(
+            f"Catch-up sweep: back to {horizon:%Y-%m-%d %H:%M} ET "
+            f"(max {args.max_pages} pages, queue cap {args.max_queue})"
+        )
+        seen, queued = poll_once(
+            seen, watchlist,
+            max_pages=args.max_pages,
+            since=horizon,
+            max_queue=args.max_queue,
+        )
+        log.info(f"Catch-up complete. {queued} missed filing(s) queued.")
+        return
 
     if args.once:
         # GitHub Actions mode: single pass.
@@ -452,7 +609,7 @@ def main() -> None:
             return
 
         log.info("Running single poll cycle...")
-        seen, queued = poll_once(seen, watchlist)
+        seen, queued = poll_once(seen, watchlist, max_pages=args.pages)
         log.info(f"Poll complete. {queued} filing(s) queued for dispatch.")
         return
 
@@ -463,7 +620,7 @@ def main() -> None:
             if not edgar_is_open():
                 time.sleep(POLL_INTERVAL)
                 continue
-            seen, queued = poll_once(seen, watchlist)
+            seen, queued = poll_once(seen, watchlist, max_pages=args.pages)
             if queued:
                 log.info(f"{queued} filing(s) queued this cycle.")
         except Exception as e:

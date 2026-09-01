@@ -23,16 +23,24 @@ Chris is a fixed-income trader specializing in **preferred stocks, baby bonds, e
 ## 2. High-level architecture / pipeline
 
 ```
-GitHub Actions (cron, every 5 min, 24/7)
+GitHub Actions (cron, every 5 min, 24/7 — but honoured every 2-11 HOURS, see §6)
         │
         ▼
-[Step: Check trading window in bash] ──(outside window)──► exit, do nothing (cheap)
-        │ (inside window)
-        ▼
-[Loop for ~4 minutes, polling every 30s]
+[Step: Check trading session in bash] ──(Sunday / Mon pre-open)──► exit (cheap)
         │
-        ├──► edgar_poller.py --once
-        │       1. Fetch EDGAR's "current filings" Atom feed (last 100 filings, all companies)
+        ├──► ALWAYS: edgar_poller.py --catchup        ← in session or out of it
+        │       Pages BACKWARDS through the feed (start=0,100,200…) to an 8h
+        │       horizon and queues any watchlist filing never seen. This is what
+        │       makes a cron gap cost latency instead of the filing.
+        │
+        │ (in session: Sofia 13:00-05:00 Mon-Fri = 06:00-22:00 ET)
+        ▼
+[Loop until session end or 5h45m, polling every 15s]
+        │
+        ├──► edgar_poller.py --once          (every 20th cycle: --catchup, 1h)
+        │       1. Read 3 pages of EDGAR's "current filings" Atom feed, deduped
+        │          by accession — 100 ENTRIES is only ~50 filings, and at peak a
+        │          page spans 5.5 minutes
         │       2. Filter to CIKs in cik_map.json (the watchlist)
         │       3. Skip anything already in seen_accessions.json
         │       4. For new matches: fetch the actual filing index page, find the
@@ -44,15 +52,20 @@ GitHub Actions (cron, every 5 min, 24/7)
         └──► openrouter_dispatch.py   (only runs if filings-inbox/ has files)
                 1. For each JSON file in filings-inbox/:
                      a. Run prefilter.should_skip() — drop noise without an LLM call
-                     b. If not skipped: call OpenRouter (with model fallback chain)
-                        using a fixed-income-analyst system prompt
-                     c. Post the LLM's summary to the Discord webhook
-                     d. Move the JSON file to filings-inbox/processed/
+                     b. If not skipped: call the LLM (provider + model fallback
+                        chain) using a fixed-income-analyst system prompt
+                     c. render_body() → the exact text that will be posted
+                     d. classify_priority(THAT BODY) → routine or tier 1-4
+                     e. Post to the main or urgent Discord webhook
+                     f. Move the JSON file to filings-inbox/processed/
                 2. Record dispatched accessions in dispatched_accessions.json
                    (also cached between runs) so restarts never double-post
 ```
 
-This whole loop (poll → filter → summarize → post) repeats every 30 seconds for as long as the GitHub Actions job is inside a trading window. Each job has a 10-minute timeout and self-limits to ~4 minutes of looping, so a new job effectively picks up every ~5 minutes where the last one left off (state survives via the two cached JSON files).
+Two things in that diagram are load-bearing and were learned the hard way:
+
+- **The catch-up sweep runs on every trigger, not just in-session ones.** GitHub's cron is honoured every 2–11 hours, so "was a runner listening at 16:52 ET?" is mostly luck. Recovery, not scheduling, is what makes coverage reliable (§6, §7).
+- **Routing reads the rendered body, step (d) after step (c).** It used to read the raw model completion, which is a *different string* — that mismatch is what put three unlisted $1,000-par note supplements into `#sec-urgent` (§7).
 
 ---
 
@@ -61,15 +74,23 @@ This whole loop (poll → filter → summarize → post) repeats every 30 second
 All files live at the repo root unless noted.
 
 ### `edgar_poller.py`
-The watcher. Two modes:
-- `--once` — poll a single time and exit. **This is the only mode GitHub Actions uses.**
+The watcher. Three modes:
+- `--once` — poll a single time and exit. The live-loop mode inside a session.
+- `--catchup` — page backwards through the feed to a time horizon and queue anything on the watchlist that was never seen, then exit. **Runs on every Actions trigger, in or out of session** (added Sep 2026 — see §7).
 - (no flag) — infinite loop, polling every `POLL_INTERVAL` (60s) forever. This was the original local-dev mode before the project moved to GitHub Actions; it's kept for local testing but isn't used in production.
 
 Key internals:
 - `USER_AGENT = "OpenClaw SEC Monitor chrisdoesdocu@gmail.com"` — SEC EDGAR requires a descriptive User-Agent with a contact email on all requests, or it will block you. **Do not remove or genericize this.**
 - `edgar_is_open()` — returns False on weekends, on a hardcoded list of federal holidays (2026–2027 dates baked in — needs updating for 2028+), and outside 6 AM–10 PM Eastern Time. This is a *safety net*, not the primary scheduling mechanism (see §6).
 - `load_watchlist()` — reads `cik_map.json` and returns `{cik_without_leading_zeros: TICKER}`. Supports two JSON shapes: `{"TICKER": "0001234567"}` or `{"TICKER": {"cik": "0001234567"}}`.
-- `fetch_recent_filings()` — hits `https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&dateb=&owner=include&count=100&output=atom`, which is SEC's global "last 100 filings across all companies" Atom feed. Parses out accession number, CIK, entity name, form type, file date, and the filing index URL from each entry.
+- `fetch_recent_filings(max_pages, since)` — walks SEC's global current-filings Atom feed (`browse-edgar?action=getcurrent&...&output=atom`), newest first, deduplicated by accession. Stops at `max_pages`, an empty page, or the first page reaching back past `since`. Parses accession, CIK, entity name, form type, file date, index URL and the entry timestamp.
+
+  **Three measured facts about that feed (2026-09-01) that the pre-Sep-2026 single-page read got wrong, and that any future change must respect:**
+  1. **`count` is hard-capped at 100.** Requesting `count=200` or `count=400` returns 100 entries. There is no way to widen a page.
+  2. **`start=` pages backwards and works.** `start=5000` still returned entries, reaching back to 09:01 ET of the previous session. This is the only mechanism that can recover a filing after the fact, and it is what `--catchup` uses.
+  3. **100 entries is NOT 100 filings, and a page is not much time.** Ownership and beneficial-ownership forms emit one entry *per role* (Reporting + Issuer, Filed by + Subject), so a page carries ~50 unique accessions on a quiet evening. At the 17:20–17:30 ET deadline rush a page held 82 unique filings spanning **5 minutes 38 seconds**. Page 0 alone is a buffer against one slow dispatch cycle, nothing more — treat it as ~6 minutes of memory at peak, not 100 filings of history.
+
+  Live polls read `LIVE_PAGES` (3) pages; the catch-up sweep reads up to `CATCHUP_PAGES` (40), normally stopping far sooner at its horizon. 3 pages per 15s poll = 0.2 req/s against SEC's 10 req/s fair-access limit.
 - **Document extraction (this was the subject of a major bug fix — see §7):**
   - `fetch_filing_text(accession, cik)` builds the EDGAR filing index URL, fetches it, then calls `extract_document_urls()` to parse the actual filing's document table.
   - `extract_document_urls()` parses the HTML `<table>` of documents in the index page. It identifies the **Seq=1 document as the primary filing document**, and separately collects any **EX-99.x exhibit URLs** (these are where 8-K press-release content actually lives — the primary 8-K document itself is often just a one-paragraph cover page that says almost nothing).
@@ -77,6 +98,9 @@ Key internals:
   - `_is_valid_doc_href()` filters out SEC navigation links, XBRL/XML/image/CSS/JS files, and anything that isn't a real `.htm`/`.html`/`.txt` filing document. It also strips the `/ix?doc=` prefix that wraps iXBRL-viewer links.
 - `write_filing_payload()` — writes the final JSON to `filings-inbox/{accession}.json` with fields: `ticker`, `accession`, `cik`, `entity_name`, `form_type`, `file_date`, `filing_url` (the EDGAR index URL — this becomes the "Link:" in the Discord post), `filing_text` (the concatenated stripped text), `detected_at_utc`.
 - `seen_accessions.json` — a flat list of every accession number the poller has ever seen, capped at the most recent 10,000. Prevents re-fetching/re-queuing the same filing across runs. **This file must be cached between GitHub Actions runs (it is — see poll.yml) or the system will re-process every filing on every run.**
+- `--max-queue` (default 40) — the cold-start guard on a catch-up sweep. If the cache is lost, `seen` is empty and an 8-hour sweep would otherwise hand the dispatcher a whole day at once. The newest 40 are queued; the rest are marked seen. **Each one past the cap is named individually in `edgar_poller.log`** — this module's failure mode is silence, and a counted-but-unnamed drop is exactly the shape of thing that goes unnoticed for a week.
+
+  ⚠ **Known exposure, deliberately accepted.** `actions/cache` only writes in its post-job step, so a job killed mid-session loses the state for everything it processed, and the next run's catch-up will re-post it (bounded at `--max-queue`). Before Sep 2026 the blast radius was ~6 minutes of feed; it is now up to the catch-up horizon. This is the right trade for this project — a duplicate post is noise, a missed rights offering costs money — but if it ever becomes a nuisance the fix is to persist `seen`/`dispatched` more often, not to shorten the horizon.
 
 ### `prefilter.py`
 Pure noise-reduction, runs **before** any LLM call (LLM calls are the scarce/rate-limited resource). Added specifically because two categories of filings were drowning out everything that mattered:
@@ -87,10 +111,16 @@ Pure noise-reduction, runs **before** any LLM call (LLM calls are the scarce/rat
 `should_skip(filing) -> (bool, reason)` is the single entry point `openrouter_dispatch.py` calls. Returns `(True, "<reason>")` to skip, `(False, "")` to proceed to the LLM. Skipped filings are moved straight to `filings-inbox/processed/` with a `skip_` filename prefix and logged — they never count against the OpenRouter rate limit and never hit Discord.
 
 **⚠️ Precedence bug fixed Aug 2026 — do not reinstate the old ordering.** `is_unlisted_offering()` used to check `LISTED_SIGNALS` *first* and return early on a match. An RBC Nasdaq-100 buffer note (accession `0000950103-26-011945`, $1,000 par, explicitly unlisted) reached Discord because the loose signal `"listed on the nasdaq"` matched the **Nasdaq-100 Index's own definition** — *"100 of the largest non-financial companies listed on The Nasdaq Stock Market"* — inside the underlier description. That forced a keep despite the filing stating twice that the notes **will not be listed**. Current precedence:
-1. An explicit `UNLISTED_SIGNAL` skips the filing outright and is **not** overridable — "the notes will not be listed on any securities exchange" has no benign reading.
-2. Otherwise structured-note vocabulary skips it, *unless* a `LISTED_SIGNAL` says this offering will list (the escape hatch for exchange-traded baby bonds sharing payoff vocabulary).
+0. **A rights offering is kept, unconditionally** (`is_rights_offering()`, Sep 2026). Requires two independent markers from `RIGHTS_OFFERING_SIGNALS`. It runs first because a 300k-character CEF prospectus will eventually contain a sentence that reads like bank-note boilerplate to a substring matcher — and one did, killing RIV's rights offering. See §7.
+1. An explicit `UNLISTED_SIGNAL` skips the filing outright and is **not** overridable — "the notes will not be listed on any securities exchange" has no benign reading. Includes the term-sheet field `Listing: None`, which is the *only* listing statement Goldman's MTN supplements make.
+2. A stated denomination of $1,000 or more with no retail-par signal skips it (`is_institutional_denomination()`, Sep 2026). This is what catches plain vanilla bank MTNs and Prudential InterNotes — no payoff vocabulary to match, sometimes no listing sentence at all, just a cover-page denomination.
+3. Otherwise structured-note vocabulary skips it, *unless* a `LISTED_SIGNAL` says this offering will list (the escape hatch for exchange-traded baby bonds sharing payoff vocabulary).
 
-Every `LISTED_SIGNALS` entry must describe **the security being offered**, not merely mention an exchange — prefer `"apply to list"` / `"approved for listing"` / `"under the symbol"` phrasings. Bare `"listed on the nasdaq"` and `"listed on the new york stock exchange"` were removed for this reason. `STRUCTURED_NOTE_SIGNALS` also gained the payoff vocabulary that filing used (`participation rate`, `upside participation`, `buffer amount`, `buffer level`, `underlier`, `initial/final underlier level`, `structured note`), any one of which would have caught it independently. Covered by `test_pipeline.py`.
+Every `LISTED_SIGNALS` entry must describe **the security being offered**, not merely mention an exchange — prefer `"apply to list"` / `"approved for listing"` / `"under the symbol"` phrasings. Bare `"listed on the nasdaq"` and `"listed on the new york stock exchange"` were removed for this reason. `STRUCTURED_NOTE_SIGNALS` also gained the payoff vocabulary that filing used (`participation rate`, `upside participation`, `buffer amount`, `buffer level`, `underlier`, `initial/final underlier level`), any one of which would have caught it independently. Covered by `test_pipeline.py`.
+
+**⚠️ `"structured note"` was in that list and was removed in Sep 2026 — do not put it back.** It is a topic word, not an offering term, and it matched the *"Structured Notes Risks. The Underlying Funds may invest in structured notes."* risk factor carried by every fund-of-funds CEF prospectus, silently dropping RIV's rights offering. The RBC note it was added for hits the seven other signals plus two `UNLISTED_SIGNALS`, and a test asserts it still does.
+
+**The asymmetry that should govern every edit to this file:** a false *keep* costs one wasted LLM call and one skippable Discord post. A false *skip* produces no post, no error and no log line anyone reads — it is indistinguishable from a quiet day, and RIV went unnoticed for four days. Tune towards keeping.
 
 **This file is meant to be tuned over time.** If Chris notices a relevant activist fund or a relevant exchange-listed issuer being filtered out, or noise getting through, the lists at the top of `prefilter.py` are the place to edit. All matching is simple lowercase substring matching — no regex needed for the activist list, though the signal lists do use plain substrings too (not regex).
 
@@ -149,6 +179,9 @@ The summarizer + Discord poster. Reads every `*.json` in `filings-inbox/`, in fi
 - **Rate limiting:** `SLEEP_BETWEEN_CALLS = 4` seconds between actual LLM calls (not between filings — pre-filtered/skipped filings don't sleep). This keeps the request rate around ~15/min, safely under OpenRouter's free-tier ~20/min cap. `dispatch()` returns a bool indicating whether an LLM call was actually attempted, and the main loop only sleeps when that's true.
 - **Idempotency:** `dispatched_accessions.json` (capped at 10,000, persisted via GitHub Actions cache) ensures a filing already posted to Discord is never posted twice, even across job restarts. If a duplicate is somehow found sitting in the inbox, it's moved out with a `dup_` prefix without any LLM call or Discord post.
 
+### `triage.py`
+Added upstream in Aug 2026 (commit `1706de6`), and not covered elsewhere in this document. `triage_filing(form_type, filing_text, entity_name)` returns a tier on the same scale as `URGENT_RULES`, computed from the **EDGAR payload rather than the model's summary**, and the dispatcher takes the more urgent of the two verdicts. It can only promote. It exists because two August misses were both "the model summarised the filing correctly and worded it in a way `classify_priority()` does not score" — CLM's rights-offering N-2 with no highlight block, and SAR's `$25`-par baby bond where the model wrote "$25 par" in prose instead of a `**Par:**` field. Read its module docstring before changing it; the design rules (nothing computed gates the alert; base forms outrank their own amendments) are each a specific miss.
+
 ### `cik_map.json`
 
 **🔴 There must only ever be ONE of these, at the repo root.** From ~Mar–Aug 2026 a second copy existed at `SEC Analyst/cik_map.json`, and `manage_watchlist.py` (which lived in that folder and resolved its path as `os.path.join(HERE, "cik_map.json")`) wrote every edit into it. The poller resolves `BASE_DIR / "cik_map.json"` where `BASE_DIR = GITHUB_WORKSPACE` = **the repo root**, so it never read that file. Consequence: commit `3d01329` "Add watchlist tickers (EARN, NHP, FBYD, BMNR, LILA, TPZ); relabel BK→BNY, BCIC→PTMN" **silently never took effect** — those six tickers were unmonitored for roughly seven weeks and the two relabels never applied. Fixed Aug 2026 by merging the newer copy into the root file (686 tickers), deleting the duplicate, moving `manage_watchlist.py` to the repo root, and anchoring its path there. If you ever find yourself adding a second copy of a state or config file, don't.
@@ -158,28 +191,32 @@ The watchlist. Maps tickers to CIK numbers — this is what determines which com
 ### `.github/workflows/poll.yml`
 The orchestrator. See §6 for the full scheduling story — this has been rewritten twice in this project already because of a GitHub-specific gotcha.
 
-Current structure:
-1. **`Check trading window`** step (id: `window`) — computes UTC time and day-of-week in bash, decides if "now" falls inside one of Chris's two trading windows, and sets a `proceed` output (`true`/`false`).
-2. Every subsequent step (`Checkout`, `Set up Python`, both cache-restore steps, the poll/dispatch loop, and the log-upload step) carries `if: steps.window.outputs.proceed == 'true'` (the log upload also ANDs in `always()` so it still runs/skips correctly on failure paths). When outside the window, the job exits almost immediately after step 1 — costing essentially nothing.
-3. Inside the window, the job: restores `seen_accessions.json` and `dispatched_accessions.json` from GitHub Actions cache, then runs a bash `while` loop for up to 240 seconds, calling `python edgar_poller.py --once` every iteration, checking if anything landed in `filings-inbox/`, and if so immediately running `python openrouter_dispatch.py`. Sleep between iterations is 30s (or less near the end of the 4-minute window). Logs (`edgar_poller.log`, `dispatch.log`) are uploaded as a workflow artifact (7-day retention) for debugging.
-4. **Secrets/vars consumed:** `NVIDIA_API_KEY` (GitHub secret — primary provider), `OPENROUTER_API_KEY` (GitHub secret — fallback provider, optional), `DISCORD_WEBHOOK` (GitHub secret — currently hardcoded as a fallback was discussed but the canonical approach is the GitHub secret; see §7 for the saga around this), plus optional GitHub Actions *variables* `NVIDIA_MODELS` and `OPENROUTER_MODEL` for overriding either model chain. Defaults live in `openrouter_dispatch.py`, not in the workflow.
+Current structure (rewritten Sep 2026 — the step is now `Check trading session`):
+1. **`Check trading session`** step (id: `window`) — computes Sofia local time and day-of-week in bash and emits **three** outputs, not one: `mode` (`live` | `catchup` | `skip`), `live`, and `catchup`. The three-way split is the point: a trigger that lands outside the session is no longer wasted, it becomes a catch-up run.
+2. `Checkout`, `Set up Python`, both cache-restore steps and the log upload carry `if: steps.window.outputs.mode != 'skip'`. Only Sunday, and Monday before the open, are `skip` — those are the only slots with no EDGAR activity behind them.
+3. **`Catch-up sweep`** (`if: catchup == 'true'`) runs `python edgar_poller.py --catchup` and dispatches whatever it recovers. It runs **before** the live loop and independently of it, so an out-of-session trigger still delivers. This step is what makes the cron cadence survivable — see §6.
+4. **`Poll and dispatch loop`** (`if: live == 'true'`) idles until the session opens if armed early, then runs a bash `while` loop until the session end or the job's 5h45m budget, calling `python edgar_poller.py --once` every 15 seconds and running `python openrouter_dispatch.py` whenever anything lands in `filings-inbox/`. **Every 20th cycle it runs a 1-hour `--catchup` sweep instead of a plain poll**, because a dispatch cycle can take minutes (LLM latency × N filings) while the feed's newest page covers under six minutes at peak — a busy patch can outrun the live read, and this heals it in place. Logs (`edgar_poller.log`, `dispatch.log`) are uploaded as a workflow artifact (7-day retention).
+5. **Secrets/vars consumed:** `NVIDIA_API_KEY` (GitHub secret — primary provider), `OPENROUTER_API_KEY` (GitHub secret — fallback provider, optional), `DISCORD_WEBHOOK` (GitHub secret — currently hardcoded as a fallback was discussed but the canonical approach is the GitHub secret; see §7 for the saga around this), plus optional GitHub Actions *variables* `NVIDIA_MODELS` and `OPENROUTER_MODEL` for overriding either model chain. Defaults live in `openrouter_dispatch.py`, not in the workflow.
 
 **The cron trigger itself is intentionally `*/5 * * * *` (every 5 minutes, all day, every day) rather than a set of narrow time-window cron expressions.** This looks wasteful but isn't — see §6, it's the actual fix for a real GitHub Actions reliability bug.
 
 ---
 
-## 4. Trading windows / schedule (current target)
+## 4. Trading session / schedule (current target)
 
-Chris is based in **Sofia, Bulgaria**. Windows are defined and evaluated in **Sofia local time** (Aug 2026 rewrite — previously UTC minute constants):
+Chris is based in **Sofia, Bulgaria**. The session is defined and evaluated in **Sofia local time** (Aug 2026 rewrite — previously UTC minute constants):
 
-| Window | Sofia local | ET equivalent | Notes |
-|---|---|---|---|
-| Day | 13:00 – 18:00, Mon–Fri | 06:00 – 11:00 ET | Opens on EDGAR's first filing minute |
-| Night | 23:00 – 03:00, Mon–Fri evenings | 16:00 – 20:00 ET | US after-hours 8-K flow |
+| Session | Sofia local | ET equivalent |
+|---|---|---|
+| Mon–Fri | 13:00 – 05:00 next day | 06:00 – 22:00 ET |
 
-The night window deliberately spans midnight and is valid **Tue–Sat** for its 00:00–03:00 half, because that half belongs to the *preceding* weekday's evening. Saturday 00:00–03:00 is Friday's US after-hours session (wanted); Monday 00:00–03:00 would be Sunday's (not wanted, and excluded).
+That is EDGAR's filing day end to end: 06:00 ET is its first filing minute, 22:00 ET its last. The session spans midnight and its 00:00–05:00 half is valid **Tue–Sat**, because that half belongs to the *preceding* weekday. Saturday 00:00–05:00 is Friday's US after-hours (wanted); Monday 00:00–05:00 would be Sunday's (not wanted, and excluded).
 
-**Why the day window starts at 13:00 and not earlier.** EDGAR only accepts filings **06:00–22:00 ET**, and Sofia 13:00 *is* 06:00 ET in both aligned DST regimes — the earliest minute at which a filing can exist. The window was 11:00–16:00 until Aug 2026, which spent its first two hours (Sofia 11:00–13:00 = 04:00–06:00 ET) polling a system that wasn't accepting filings: `edgar_is_open()` short-circuited every cycle and the loop idled. Moving to 13:00–18:00 kept the same 5-hour runtime but made all of it productive — **35 → 45 productive hours/week for identical cost**. Do not move the start earlier; there is nothing there to find.
+**⚠ Sep 2026: this replaced two narrow windows, and the reason matters.** The old schedule ran 06:00–11:00 and 16:00–20:00 ET, leaving **11:00–16:00 ET — five hours across the middle of the US session — with no coverage at all**. Nuveen's NMCO rights offering (`497AD`, `0001999371-26-018939`) was filed at **13:51 ET on 2026-08-27**, inside that hole. Run #2013 was created at 13:51 ET the same day, evaluated the two windows, found itself between them, and exited after six seconds. The hole was never a deliberate choice; it was left over from an era when the windows were sized around OpenRouter rate limits that no longer apply. Runtime on a public repo is free, so there is no reason not to cover the whole filing day.
+
+**Why the session starts at 13:00 and not earlier.** EDGAR only accepts filings **06:00–22:00 ET**, and Sofia 13:00 *is* 06:00 ET in both aligned DST regimes — the earliest minute at which a filing can exist. Do not move the start earlier; there is nothing there to find. (The window was 11:00–16:00 Sofia until Aug 2026, which spent its first two hours polling a system that wasn't accepting filings.)
+
+**A 16-hour session against a 6-hour job ceiling.** One job runs to the session end or 5h45m, whichever comes first, so a full session is two or three chained jobs. Chaining is free when a trigger is parked as pending behind the running job; when the cron goes quiet it is the catch-up sweep, not the chain, that keeps filings from being lost.
 
 During the 2–3 weeks each spring/autumn when US and EU clocks are out of step, Sofia 13:00 lands on 07:00 ET rather than 06:00 — still live, just an hour into the day. Not worth compensating for.
 
@@ -217,7 +254,14 @@ During the 2–3 weeks each spring/autumn when US and EU clocks are out of step,
 
 **⚠️ CORRECTION (Aug 2026) — the `*/5` cron did NOT fix the throttling.** This section previously claimed it did. Measured from the actual run history on 2026-08-06/07, consecutive triggers were **174, 139, 98, 134, 102, 92, 348, 179 and 104 minutes apart** — a cadence of 1.5–3 hours, never 5 minutes. Run *numbers* are consecutive across those gaps, so the runs are not merely delayed, **they are never created**. Corroborating arithmetic: the repo has ~1,218 total workflow runs after ~4 months; a true `*/5` cadence would have produced ~34,000. Assume the cron fires roughly every two hours and design for that. Do not add more cron entries hoping to compensate — narrow crons were what got throttled hardest in the first place, and `*/5` is still the best backstop available.
 
-**Consequence, and the fix: pre-window arming.** With a ~2h trigger cadence, a window is covered only if a trigger happens to land inside it. On 2026-08-06 none landed between 21:39 and 03:27 and **the entire night window was missed**. So a trigger landing shortly *before* a window now holds the runner and opens with the window instead of exiting:
+**Sep 2026 update — the cadence got worse, and arming alone was not enough.** Measured from run history over 2026-08-26/28: consecutive triggers **6h36m, 11h19m, 7h56m and 9h42m** apart. Two of the three filings Chris reported missing fall directly out of that:
+
+- **RIV 424B2 `0001398344-26-016049`**, accepted 16:52 ET Fri 2026-08-28 — inside the old night window. Run #2015 covered 09:23–11:00 ET and ended; the next trigger was created at **19:05 ET**, 2h13m after the filing. By then the feed's page 0 reached back only minutes, so the run that finally started could not see it and never would.
+- **NMCO 497AD**, 13:51 ET — the window hole described in §4.
+
+The 2-hour pre-session look-ahead cannot bridge a 9-hour trigger gap, and no amount of tuning it will. **So the fix is not scheduling, it is recovery: every run now begins with a `--catchup` sweep that pages backwards through the feed and queues anything on the watchlist it has never seen — in session or out of it.** A cron gap now costs latency instead of the filing. The 13:51 ET trigger that exited in six seconds would have delivered NMCO under the current design.
+
+**Consequence, and the earlier partial fix: pre-window arming.** With a ~2h trigger cadence, a window is covered only if a trigger happens to land inside it. On 2026-08-06 none landed between 21:39 and 03:27 and **the entire night window was missed**. So a trigger landing shortly *before* a window now holds the runner and opens with the window instead of exiting:
 - Look-ahead `MAX_WAIT_SECONDS` = 2h, matched to the observed cadence.
 - `MAX_TOTAL_SECONDS` = 5h45m covers wait + polling combined, against the 6h job ceiling (`timeout-minutes: 350`).
 - A wait that would leave under 30 min of polling is not worth a runner, so it skips.
@@ -227,7 +271,7 @@ During the 2–3 weeks each spring/autumn when US and EU clocks are out of step,
 
 **What arming cannot fix:** runs #1220 and #1221 both died after exactly 15m02s with `The job was not acquired by Runner of type hosted even after multiple attempts` plus an `Internal server error` correlation ID. That is GitHub failing to allocate a runner, entirely server-side, and no workflow change addresses it. The mitigation is the `*/5` backstop plus the parked pending run — both of which need GitHub's scheduler to be working at all.
 
-**The original (still-valid) reasoning for the single cron:** replace all narrow cron entries with a **single `*/5 * * * *` entry that fires every 5 minutes, all day, every day** (not just during trading windows). A high-frequency, simple, constantly-firing cron is treated by GitHub's scheduler as "active" and gets honored reliably. The actual "should we do real work right now" decision moved **out of the cron expression and into a bash time-window check inside the job** (the `Check trading window` step described in §3). Outside the windows, the job still fires every 5 minutes but does almost nothing and finishes in seconds — which costs nothing on a public repo's unlimited Actions minutes.
+**The original (still-valid) reasoning for the single cron:** replace all narrow cron entries with a **single `*/5 * * * *` entry that fires every 5 minutes, all day, every day** (not just during trading windows). A high-frequency, simple, constantly-firing cron is treated by GitHub's scheduler as "active" and gets honored reliably. The actual "should we do real work right now" decision moved **out of the cron expression and into a bash time-window check inside the job** (the `Check trading session` step described in §3). Outside the session the job still fires, but since Sep 2026 it does something useful rather than nothing: it runs a catch-up sweep and exits in a minute or two — which costs nothing on a public repo's unlimited Actions minutes.
 
 **Manual runs bypass the window check (added Aug 2026).** The step's first branch is `if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]` → `PROCEED=true`. Without it, a manual "Run workflow" fired outside a Sofia window skips every step and produces a green, completely inert run — which reads as success but polls nothing and posts nothing, and cost real debugging time at least once. `edgar_poller.py`'s own `edgar_is_open()` (6 AM–10 PM ET, weekdays, non-holiday) remains as a second guard on manual runs, so a manual trigger at 3 AM ET still polls nothing — it just logs "EDGAR is closed right now" instead, which is at least diagnosable.
 
@@ -261,6 +305,42 @@ This project went through a long, painful debugging arc. Recording it so a futur
 
 8. **A leftover test fixture** (`filings-inbox/test_999999.json`), originally created via PowerShell `Out-File` to manually exercise the dispatcher without waiting for a real filing. PowerShell's `Out-File` writes a UTF-8 **BOM** (byte-order mark) by default, which broke `json.loads()` when the dispatcher tried to read it. Not worth re-fixing generally (the dispatcher doesn't need BOM-tolerant JSON parsing for real EDGAR-sourced files, which are always clean UTF-8) — just don't create test fixtures this way again; use a heredoc or a Python one-liner instead, or `Out-File -Encoding utf8NoBOM` if PowerShell must be used.
 
+### Sep 2026 — three filings, four bugs, all found from one Discord screenshot
+
+Chris reported: RIV's and NMCO's rights offerings never arrived, and three Goldman/Prudential `$1,000`-par unlisted note supplements pinged `#sec-urgent`. Each turned out to be a separate defect; the two "missed" filings had **two independent** causes each, so fixing either alone would have left them still missing.
+
+1. **Coverage** — §4 (the 11:00–16:00 ET hole) and §6 (a 9h42m cron gap). Fixed by the full-day session and, more importantly, the catch-up sweep.
+
+2. **`prefilter.py` silently dropped the RIV rights offering.** The bare signal `"structured note"` — added Aug 2026 for the RBC buffer note — matched this sentence in RiverNorth's prospectus: *"Structured Notes Risks. The Underlying Funds may invest in structured notes."* That is a **risk factor about what the fund holds**, not a description of the security being offered. A 9.1M-share rights offer with rights trading as `RIV.RT` was dropped on it, and produced no post, no error, and no log line anyone would look at.
+   - `"structured note"` is **removed and must not be reinstated**. It is a topic word, not an offering term. The RBC note that motivated it hits seven other structured signals *and* two `UNLISTED_SIGNALS`, so nothing regressed — there is a test proving exactly that.
+   - New `is_rights_offering()` runs **first and wins outright**. Rationale: a 300k-character CEF prospectus will eventually contain a sentence that looks like bank-note boilerplate to a substring matcher, and rights vocabulary is far better evidence than one stray phrase.
+   - **Because it wins outright, it demands two independent kinds of evidence**, and getting there took two iterations against real filings:
+     - *Attempt 1* — any two markers from one flat list. This matched Gladstone Capital's `$60m 7.000% Notes due 2029` and Saratoga's `$85m 8.00% Notes due 2031`, because a BDC base prospectus lists "subscription rights" among the securities it registers and carries a boilerplate "Rights Offerings" section. Split into `RIGHTS_OFFERING_SIGNALS` (topic) and `RIGHTS_OFFER_TERMS` (mechanics — over-subscription, primary subscription, record date stockholders, transferable rights), requiring one of each.
+     - *Attempt 2* — still matched Oxford Square's `$150m Common Stock` ATM, because BDC base prospectuses describe rights mechanics in detail (the below-NAV rules require it). Added `RIGHTS_COVER_CHARS`: the topic must appear in the first 4,000 characters. Measured first-mention offsets — **RIV 350, NMCO 497AD 158, NMCO 424B2 525** versus **OXSQ 9,632, SAR 11,630, HTGC 25,135, GLAD 166,347**. A real rights offering names itself on the cover, because that is what is being sold.
+
+   Verified against 20 real filings: all three rights offerings kept, all four bank notes dropped, and 11 of 13 income-security offerings kept (the two skips are Gladstone's and Hercules' genuinely unlisted BDC notes).
+
+3. **`prefilter.py` let the Goldman and Prudential notes through to the LLM.** Both are plain vanilla $1,000-par paper — no structured-product vocabulary to match, so `STRUCTURED_NOTE_SIGNALS` found nothing, and neither wrote a sentence about listing that `UNLISTED_SIGNALS` could match:
+   - Goldman's pricing supplements carry a bare cover-page field, **`Listing: None`** — now in `UNLISTED_SIGNALS`, anchored on the colon.
+   - Prudential's InterNotes make **no listing statement at all**; the only thing marking them as out-of-universe is `Minimum Denomination/Increments: $1,000.00`. New `is_institutional_denomination()` reads a stated denomination of $1,000-and-up, anchored on the word "denomination" so the many incidental `$1,000`s in a real prospectus (a CEF expense table's *"expenses you would pay on a $1,000 investment"*, an asset-coverage-per-$1,000 ratio) cannot match. A retail-par signal ($25 par, depositary share, baby bond) vetoes it, so MBIN-style *"$1,000 per share (equivalent to $25 per depositary share)"* survives.
+
+4. **Shelf boilerplate was being read as a listing statement** (found while regression-testing the above, not reported). `UNLISTED_SIGNALS` matched this, from the base prospectus of every shelf AGNC and Rithm file from:
+
+   > *"Unless we inform you otherwise in the applicable prospectus supplement, the debt securities will not be listed on any securities exchange."*
+
+   Both filings that hit it were offering **common stock**, not debt securities. Skipping them happened to be right for other reasons — but the same sentence sits in the shelf a $25-par preferred would be taken down under, so this is the RIV failure mode waiting to happen on a security Chris does trade. `unlisted_statement()` now ignores an occurrence introduced by a `SHELF_HEDGES` phrase within `HEDGE_WINDOW` (160 chars). **If any unhedged occurrence exists anywhere in the document the filing is still skipped**, so a pricing supplement that hedges once and then states it plainly — as RBC's does — is unaffected.
+
+5. **Routing ran on text the reader never saw.** `dispatch()` called `classify_priority(summary, ...)` on the **raw model completion**, then `finalize_message()` dropped a second summary copy, stripped the model's deliberation, and truncated to Discord's cap — and posted *that*. When the two disagree you get exactly what Chris screenshotted: a `#sec-urgent` ping with a mention, on a message whose visible body carries a 📋 lead emoji, no highlight block, and `Listing: UNLISTED` / `Par: $1,000` — text that `classify_priority()` scores as routine. Both facts were true at once because they were computed from different strings.
+   - `finalize_message()` is split into `body_budget()` / `render_body()` / `assemble_message()`, and `dispatch()` now classifies `render_body(...)`. The mention budget is reserved *before* the tier is known, so the body is byte-identical either way and a late routing decision cannot re-truncate what was already classified.
+   - **The invariant: whatever routes a message must be visible in it.** Do not reintroduce a routing read of the raw completion, not even "just for the header".
+   - `strip_meta_commentary()` also gained a sentence-level scrub for prompt vocabulary. The PRU post ended *"...Omit highlight block — no priority-1 to -4 trigger is literally stated. Proceeds, size, and agent ..."* mid-paragraph, where the line-anchored `_META_LINE_RE` could not reach it.
+
+6. **Rights-offering routing was written twice, and the earlier answer won.** This work was done against a checkout six commits behind `origin/main`, and upstream had already solved it: commit `1706de6` added a dedicated tier-2 rule with the 🧨 emoji, ungated through `_TRADEABLE_GATED_KEYWORDS`, plus `triage.py` classifying from `form_type` and `filing_text` so the routing does not depend on how the model words the summary at all. That is strictly stronger than gating on fields the model may or may not write, so the duplicate (`_is_rights_offering()` in the dispatcher, a `## 📢 RIGHTS OFFERING` highlight block, a 📢 emoji-guide entry) was dropped in the rebase. What survived from this side is the `— RIGHTS OFFERING —` **body section** in `SYSTEM_PROMPT`, which shapes the fields in the summary and touches no routing.
+
+   The two routing guards now compose deliberately, and the ordering in `dispatch()` matters: `render_body()` first, `classify_priority()` on that body, then `triage_filing()` on the payload, promote-only. One stops a ping whose justification the reader cannot see; the other stops a miss the reader never learns about. Neither weakens the other, because triage can only promote.
+
+`test_pipeline.py` carries 124 checks after the merge, including the first coverage of `edgar_poller.py` (feed paging, role-entry dedupe, horizon stop) — previously listed in §9 as the most valuable untested area.
+
 ---
 
 ## 8. Current system prompt (verbatim, for reference)
@@ -284,7 +364,9 @@ If asked to revise this prompt again, **read the actual current `SYSTEM_PROMPT` 
 - **`FEDERAL_HOLIDAYS` in `edgar_poller.py` only covers 2026–2027.** Needs extending before it runs out, or rewriting to compute holidays programmatically (e.g. via the `holidays` Python package) rather than hardcoding dates.
 - **`cik_map.json` watchlist maintenance is manual.** No tooling currently exists to add/remove tickers, validate CIKs, or check for typos. Could be worth a small helper script (e.g. look up a ticker's CIK from SEC's own ticker-to-CIK JSON file at `https://www.sec.gov/files/company_tickers.json`) so Chris can add coverage by ticker symbol instead of hand-finding CIK numbers.
 - **`prefilter.py`'s activist list and structured-note/listed signal lists are static and manually maintained.** Worth periodically reviewing against real Discord output — if Chris notices either false negatives (relevant filings dropped) or false positives (junk getting through), the fix is almost always editing these lists, not the matching logic itself.
-- ~~**No automated tests.**~~ **Partly addressed Aug 2026:** `test_pipeline.py` is an offline, dependency-free regression suite (`python test_pipeline.py`), run automatically by `.github/workflows/test.yml` on any push touching a `.py` file. It covers the prefilter precedence rule, the `finalize_message()` footer/truncation guarantees, and `strip_reasoning()`. **Every case in it corresponds to a bug that actually reached Discord — add one whenever a bad post gets through.** Still uncovered: `edgar_poller.py`'s document extraction (`extract_document_urls()` returning a non-empty list for a known accession, and the primary-doc + EX-99.x concatenation), which is where bug #2 lived and is the most valuable remaining gap.
+- ~~**No automated tests.**~~ **Partly addressed Aug 2026:** `test_pipeline.py` is an offline, dependency-free regression suite (`python test_pipeline.py`), run automatically by `.github/workflows/test.yml` on any push touching a `.py` file. It covers the prefilter precedence rule, the `finalize_message()` footer/truncation guarantees, and `strip_reasoning()`. **Every case in it corresponds to a bug that actually reached Discord — add one whenever a bad post gets through.** **Sep 2026:** 88 checks, and `edgar_poller.py` is no longer untested — feed paging, role-entry dedupe and the catch-up horizon all have fixtures. Still uncovered: `extract_document_urls()` (returning a non-empty list for a known accession, and the primary-doc + EX-99.x concatenation), which is where bug #2 lived and is now the most valuable remaining gap. It needs a saved index-page fixture to stay offline.
+- **A killed mid-session job can cause duplicate posts.** `actions/cache` writes only in its post-job step, so state for everything a killed job processed is lost, and the next run's catch-up re-posts it (bounded at `--max-queue`, default 40). Accepted deliberately — see §3 — but the clean fix is to persist `seen_accessions.json` / `dispatched_accessions.json` more often, not to shorten the catch-up horizon.
+- **`edgar_is_open()`'s federal-holiday list runs out after 2027** and is hardcoded. On an unlisted holiday the session runs and finds nothing, which costs runner minutes (free) and nothing else — so this is a tidiness item, not a correctness one.
 - **Logs are only retained 7 days** via the workflow artifact upload. If multi-week debugging is ever needed, that retention may need lengthening, though this trades off against GitHub's storage limits for public repos.
 - **GitHub Secrets UI confusion (see bug #6)** will likely resurface if anyone other than Chris tries to update `DISCORD_WEBHOOK` or `OPENROUTER_API_KEY` later — worth just remembering that the empty-looking field after save is expected/normal, not a sign the update failed.
 

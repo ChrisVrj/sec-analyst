@@ -1,27 +1,46 @@
 # sec-poller
 
-GitHub Actions–based SEC filing monitor. Polls EDGAR continuously during your
-trading windows, matches filings against your watchlist, calls an LLM for a
+GitHub Actions–based SEC filing monitor. Polls EDGAR continuously through the
+filing day, matches filings against your watchlist, calls an LLM for a
 fixed-income-analyst summary, and posts to Discord.
 
-**Coverage:** one long-running job per window polls every 15 seconds with no
-gaps. Windows are evaluated in Sofia local time, so the EEST/EET switch needs
-no maintenance.
+**Coverage:** one long-running job polls every 15 seconds through EDGAR's
+entire filing day. Times are evaluated in Sofia local time, so the EEST/EET
+switch needs no maintenance.
 
-| Window | Sofia | ET | Why |
-|---|---|---|---|
-| Day | 13:00 – 18:00 Mon–Fri | 06:00 – 11:00 | Opens on EDGAR's first filing minute |
-| Night | 23:00 – 03:00 Mon–Fri eve | 16:00 – 20:00 | US after-hours 8-K flow |
+| Session | Sofia | ET |
+|---|---|---|
+| Mon–Fri | 13:00 – 05:00 next day | 06:00 – 22:00 |
 
-Both sit entirely inside EDGAR's filing hours (06:00–22:00 ET), so no cycle is
-wasted. The day window was 11:00–16:00 until Aug 2026, which spent its first
-two hours polling a system that wasn't accepting filings yet.
+That is EDGAR's filing day end to end. Until Sep 2026 this was two narrow
+windows — 06:00–11:00 and 16:00–20:00 ET — with **five uncovered hours across
+the middle of the US session**. Nuveen's NMCO rights offering was filed at
+13:51 ET on 2026-08-27, into that hole; a cron trigger landed at 13:51 ET the
+same day, found itself between windows, and exited after six seconds.
 
-**GitHub throttles the `*/5` cron to roughly one trigger every 2 hours** — this
-is measured, not theoretical (see AGENTS.md §6). A window would therefore be
-covered only when a trigger happened to land inside it. To compensate, a
-trigger landing within 2 hours *before* a window holds the runner and opens
-with the window rather than exiting. Look for `(armed early)` in the run log.
+**GitHub throttles the `*/5` cron to roughly one trigger every 2 hours, and up
+to 11 hours in a bad stretch** — measured, not theoretical (see AGENTS.md §6).
+Three things compensate:
+
+- a trigger landing within 2 hours *before* the session holds the runner and
+  opens with it (`(armed early)` in the run log)
+- a job runs to the session end or its 5h45m ceiling, so a 16-hour session is
+  two or three chained jobs rather than hundreds of short ones
+- **every run starts with a catch-up sweep**, in or out of session — see below
+
+**Catch-up sweep.** EDGAR's current-filings feed pages backwards with `start=`,
+so a run can read its way back through a blackout instead of seeing only the
+newest 100 entries. That matters more than it sounds: at the 17:20–17:30 ET
+deadline rush one page spans **five and a half minutes**, and 100 entries is
+only ~50 filings because ownership forms emit one entry per role. The feed on
+its own remembers almost nothing.
+
+    python edgar_poller.py --catchup              # default: back 8h, ≤40 pages
+    python edgar_poller.py --catchup --catchup-hours 2 --max-pages 12
+
+A gap in GitHub's cron now costs latency, not the filing. `--max-queue`
+(default 40) bounds a cold start after a lost cache; anything past the cap is
+named in `edgar_poller.log` rather than silently dropped.
 
 The LLM is **NVIDIA Nemotron 3** via NVIDIA NIM (free, ~40 req/min, no daily
 cap), with **OpenRouter free models as an automatic fallback**.
@@ -132,7 +151,7 @@ served the filing.
 
 | Limit                    | Value        | Impact                                     |
 |--------------------------|--------------|--------------------------------------------|
-| EDGAR fair-access        | 10 req/s     | 15s poll = 0.07 req/s ✅                    |
+| EDGAR fair-access        | 10 req/s     | 3 feed pages per 15s poll = 0.2 req/s ✅    |
 | NVIDIA NIM free req/min  | ~40/model    | 2s sleep keeps you at ~30 — best effort, not a guarantee |
 | NVIDIA NIM free req/day  | none published | No daily ceiling to plan around ✅       |
 | OpenRouter free req/min  | 20           | 4s sleep keeps you at ~15                  |
@@ -154,9 +173,9 @@ Both are optional. With neither set, behaviour is unchanged — everything lands
 in one channel with no pings. Create a `#sec-urgent` channel, add its webhook,
 and turn on push notifications for that channel only.
 
-Classification reads the `##` highlight header and the line-1 emoji, not the
-body prose — a NAV report that mentions "redemption of shares at net asset
-value" in passing stays routine. If the urgent webhook fails, the post is
+Classification reads the `##` highlight header and the line-1 emoji of the
+**posted body**, not the body prose — a NAV report that mentions "redemption of
+shares at net asset value" in passing stays routine. If the urgent webhook fails, the post is
 retried on the main webhook rather than lost.
 
 **On calendar-driven forms the emoji alone doesn't ping.** Proxies, annual
@@ -174,6 +193,67 @@ demoted when its body shows `Listing: UNLISTED`, `Par: $1,000` (institutional
 paper, even if NYSE-listed), `Product: common stock`, or no preferred /
 depositary / baby-bond / $25-par signal at all. Redemptions, M&A and tender
 offers are **not** gated — a missed call notice costs more than a spare ping.
+
+The one common-share exception is a **CEF or BDC rights offering**, which has
+its own tier-2 rule (🧨) and is deliberately **not** gated: shares outstanding
+rise on a fixed date at a price struck off NAV, so a fund trading at a premium
+gives that premium up. It would fail the retail-income test by construction,
+which is exactly why the test does not apply to it.
+
+**Two independent guards, pulling in opposite directions.** `triage.py` reads
+`form_type` and `filing_text` — the EDGAR payload, which does not vary with
+phrasing — and can only ever *promote*. `classify_priority()` reads the summary
+and can demote. One stops a miss the reader never learns about; the other stops
+a ping the reader cannot see the reason for.
+
+**Routing reads the message that gets posted, not the model's raw output.**
+Those are not the same string: the dispatcher drops a second summary copy,
+strips the model's deliberation, and truncates to Discord's cap. Three
+Goldman/Prudential note supplements pinged `#sec-urgent` on 2026-08-31 while
+the visible body said `Listing: UNLISTED` / `Par: $1,000` and carried no
+highlight block — whatever justified the ping lived in the part that never got
+posted. The invariant now: **whatever routes a message is visible in it.**
+
+## What never reaches the LLM
+
+`prefilter.py` drops noise before a single token is spent. Two rules matter
+most, and both are tuned against real filings:
+
+| Dropped | Signal |
+|---|---|
+| Form 3/4/5 from anyone but a tracked activist | filer name |
+| Structured notes (autocallable, buffer, participation rate, underlier) | payoff vocabulary |
+| Explicitly unlisted offerings | "will not be listed…", and the term-sheet field `Listing: None` |
+| $1,000-and-up paper | a stated `Denominations: $1,000` / `Minimum Denomination: $1,000`, with no $25-par or depositary-share signal anywhere |
+
+**Rights offerings are kept unconditionally**, checked before everything else.
+A CEF rights prospectus runs 250–300k characters of fund boilerplate, and
+somewhere in it sits a risk factor about structured notes, a line about
+preferred shares that "may not be listed" for their first 30 days, and an
+expense table denominated in $1,000. Any of those can look like a bank note to
+a substring matcher — and one of them did: RiverNorth's RIV rights offering was
+dropped in Aug 2026 by the sentence *"Structured Notes Risks. The Underlying
+Funds may invest in structured notes."*
+
+Because that keep overrides everything, it demands real evidence — the topic
+on the **cover page** *and* a mechanic of a live offer (over-subscription
+privilege, primary subscription, record-date stockholders, transferable
+rights). Measured first mention of the topic: RIV 350 chars in, NMCO 158; a
+BDC common-stock ATM 9,632; a 7.00% notes offering 166,347.
+
+**Shelf boilerplate doesn't count as a listing statement.** Every shelf's base
+prospectus says *"Unless we inform you otherwise in the applicable prospectus
+supplement, the debt securities will not be listed on any securities
+exchange"* — including the shelf a $25-par preferred is taken down under. A
+hedged occurrence is ignored; an unhedged one anywhere in the document still
+drops the filing.
+
+⚠ **A false skip is silent.** No post, no Discord error, no way to notice —
+it looks exactly like a quiet day, and RIV went unnoticed for four days. A
+false *keep* costs one LLM call and one skippable post. Tune towards keeping,
+and make every signal describe *the security being offered* — never a risk
+factor, an index definition, a portfolio holding, or another security class on
+the same shelf.
 
 ## Tests
 
@@ -197,6 +277,9 @@ reached Discord — **add one whenever a bad post gets through.**
 ```bash
 # Continuous mode (original behavior, no --once flag):
 python edgar_poller.py
+
+# Recover anything filed while nothing was listening:
+python edgar_poller.py --catchup --catchup-hours 8
 
 # Dispatcher (reads whatever is in filings-inbox/):
 NVIDIA_API_KEY=nvapi-... DISCORD_WEBHOOK=https://... python openrouter_dispatch.py
