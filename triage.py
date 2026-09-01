@@ -54,6 +54,7 @@ log = logging.getLogger("DISPATCH")
 # 0 means nothing structural was found.
 TIER_REDEMPTION = 1
 TIER_NEW_ISSUE = 2
+TIER_TENDER = 4
 TIER_NONE = 0
 
 # --- Forms that register or price new securities ---------------------------
@@ -71,6 +72,27 @@ CAPITAL_RAISE_FORMS = frozenset({
 # Shelf housekeeping and Rule 482 advertising. Mostly annual updates and
 # marketing, so these reach a tier only when the text names an offering.
 SOFT_FORMS = frozenset({"486APOS", "486BPOS", "497", "497K", "497AD", "FWP"})
+
+# --- Tender and exchange offers -------------------------------------------
+# A Schedule TO is a standing bid for a security that already trades, at a
+# stated price and with an expiry. There is nothing to interpret: the form
+# type alone is the event, which is what makes it safe to page on.
+#
+# Added 2026-09-01 after NFJ's SC TO-I (0001193125-26-377910, a Virtus CEF
+# self-tender) went unposted. Nothing here would have rescued that particular
+# miss — it never reached the model — but the routing gap it exposed is real:
+# tender offers are tier 4 in URGENT_RULES and this module scored them 0, so
+# they paged only when the model happened to write a "## 🔁 TENDER" block.
+# That is the same dependence on the model's wording that lost CLM.
+#
+# Amendments page too, unlike the capital-raise forms above. An amended
+# Schedule TO is usually a price increase or an extension of the expiry —
+# both are terms of a live offer, not an announcement already made.
+TENDER_FORMS = frozenset({
+    "SC TO-I", "SC TO-T", "SC TO-C",
+    "SC 13E3", "SC 13E1",
+    "SC 14D9",
+})
 
 # --- What the text has to say ----------------------------------------------
 
@@ -217,6 +239,13 @@ def triage_filing(form_type, filing_text="", entity_name=""):
     if targets:
         notes.append(describe_targets(targets))
         return TIER_REDEMPTION, "redemption (filing text)", notes
+
+    if base_form in TENDER_FORMS:
+        notes.append(
+            f"{base_form} is a standing bid for an outstanding security"
+            + (" (amendment — terms of a live offer)" if is_amendment else "")
+        )
+        return TIER_TENDER, "tender / exchange offer (form type)", notes
 
     is_rights = bool(_RIGHTS_OFFERING_RE.search(text))
     if is_rights:

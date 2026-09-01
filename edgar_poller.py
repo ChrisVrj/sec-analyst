@@ -41,6 +41,7 @@ BASE_DIR = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).parent))
 
 WATCHLIST_FILE = BASE_DIR / "cik_map.json"
 SEEN_FILE      = BASE_DIR / "seen_accessions.json"
+FETCH_FAIL_FILE = BASE_DIR / "fetch_failures.json"
 INBOX_DIR      = BASE_DIR / "filings-inbox"
 LOG_FILE       = BASE_DIR / "edgar_poller.log"
 
@@ -67,6 +68,12 @@ LIVE_PAGES       = 3      # ~17 min of depth at peak, ~7 h on a quiet evening
 CATCHUP_PAGES    = 40     # ceiling; the horizon normally stops it far sooner
 CATCHUP_HOURS    = 8      # covers the longest observed cron gap plus slack
 CATCHUP_MAX_QUEUE = 40    # cold-start guard, see poll_once()
+
+# A filing whose documents cannot be fetched is retried on later cycles rather
+# than written off. EDGAR returns 503s and read timeouts under normal load, and
+# an index page is not always complete in the seconds after the filing appears
+# in the feed — which is exactly when a 15-second poll first sees it.
+MAX_FETCH_ATTEMPTS = 6
 
 # ---------------------------------------------------------------------------
 # Federal holidays (EDGAR closed)
@@ -145,6 +152,56 @@ def save_seen(seen: set[str]) -> None:
         SEEN_FILE.write_text(json.dumps(sorted(seen)))
     except Exception as e:
         log.warning(f"Could not save seen_accessions.json: {e}")
+
+
+def load_fetch_failures() -> dict[str, int]:
+    """{accession: consecutive failed fetch attempts}.
+
+    Deliberately NOT cached between Actions runs. Losing it only resets the
+    attempt counters, which costs a few extra retries — the safe direction.
+    Within a run it matters, because the workflow starts a fresh process for
+    every poll cycle, so an in-memory counter would never survive.
+    """
+    if FETCH_FAIL_FILE.exists():
+        try:
+            return {k: int(v) for k, v in json.loads(FETCH_FAIL_FILE.read_text()).items()}
+        except Exception as e:
+            log.warning(f"Could not load fetch_failures.json: {e}")
+    return {}
+
+
+def save_fetch_failures(failures: dict[str, int]) -> None:
+    try:
+        FETCH_FAIL_FILE.write_text(json.dumps(failures))
+    except Exception as e:
+        log.warning(f"Could not save fetch_failures.json: {e}")
+
+
+def notify_failure(message: str) -> None:
+    """Push a give-up to Discord.
+
+    The poller has always logged these to edgar_poller.log, which is a
+    7-day Actions artifact nobody opens. A filing this module abandons is
+    indistinguishable from a quiet day otherwise, and that is the exact
+    failure this project keeps paying for.
+    """
+    webhook = os.environ.get("DISCORD_WEBHOOK", "").strip()
+    if not webhook:
+        return
+    try:
+        req = urllib.request.Request(
+            webhook,
+            data=json.dumps({"content": message[:1900]}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                # Discord's WAF 403s the default urllib User-Agent. This
+                # header is load-bearing; see AGENTS.md 7.
+                "User-Agent": "DiscordBot (https://github.com/ChrisVrj/sec-analyst, 1.0)",
+            },
+        )
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        log.warning(f"Could not post failure notice to Discord: {e}")
 
 
 def load_watchlist() -> dict[str, str]:
@@ -251,7 +308,7 @@ def fetch_recent_filings(
     appeared to have.
     """
     hits: list[dict] = []
-    seen_accessions: set[str] = set()
+    seen_roles: set[tuple[str, str]] = set()
     entries_read = 0
 
     for page in range(max_pages):
@@ -262,9 +319,15 @@ def fetch_recent_filings(
 
         oldest = None
         for hit in entries:
-            acc = hit["accession"]
-            if acc and acc not in seen_accessions:
-                seen_accessions.add(acc)
+            # Deduplicate on (accession, CIK), NOT on accession alone. The feed
+            # emits one entry per ROLE and each carries its own CIK in the
+            # href, so collapsing to the first entry throws away the role that
+            # names the watchlist company. Measured on 2026-09-01: of 119
+            # multi-role filings touching the watchlist, 114 had the watchlist
+            # CIK in the SECOND entry — including a Saba Form 4 on ECF.
+            key = (hit["accession"], hit["cik"])
+            if hit["accession"] and key not in seen_roles:
+                seen_roles.add(key)
                 hits.append(hit)
             ts = _entry_time(hit)
             if ts and (oldest is None or ts < oldest):
@@ -281,9 +344,10 @@ def fetch_recent_filings(
             newest, tail = _entry_time(hits[0]), _entry_time(hits[-1])
             if newest and tail:
                 span = f" spanning {newest:%H:%M} back to {tail:%H:%M} ET"
+        filings = len({h["accession"] for h in hits})
         log.info(
             f"Feed: {entries_read} entries over {min(max_pages, (entries_read + 99) // 100)} "
-            f"page(s) -> {len(hits)} unique filing(s){span}"
+            f"page(s) -> {len(hits)} role(s) / {filings} filing(s){span}"
         )
 
     return hits
@@ -490,14 +554,31 @@ def poll_once(
         log.warning("Empty response from EDGAR feed")
         return seen, 0
 
+    # One filing, one decision. The feed gives a filing one entry per role and
+    # only one of them may name the watchlist company — a Form 4 lists the
+    # insider first and the issuer second, a bank shelf lists the funding
+    # subsidiary first and the guarantor second. Picking the watchlist role
+    # here is what stopped `seen.add(accession)` on the FIRST role from
+    # discarding the filing before the matching role was ever examined.
+    best: dict[str, dict] = {}
+    for hit in hits:
+        acc = hit["accession"]
+        if not acc:
+            continue
+        current = best.get(acc)
+        if current is None or (current["cik"] not in watchlist
+                               and hit["cik"] in watchlist):
+            best[acc] = hit
+
     queued = 0
     over_cap: list[str] = []
+    failures = load_fetch_failures()
 
-    for hit in hits:
+    for hit in best.values():
         accession = hit["accession"]
         cik       = hit["cik"]
 
-        if not accession or accession in seen:
+        if accession in seen:
             continue
 
         if watchlist and cik not in watchlist:
@@ -513,12 +594,41 @@ def poll_once(
 
         filing_text, doc_urls = fetch_filing_documents(accession, cik)
 
-        seen.add(accession)
-
         if not filing_text:
-            log.warning(f"No text for {ticker} {accession} — skipping dispatch")
-            save_seen(seen)
+            # NOT marked seen. EDGAR 503s, times out, and serves incomplete
+            # index pages in the seconds after a filing appears — which is
+            # when a 15-second poll first asks for it. Marking it seen here
+            # is a permanent, silent loss of a filing that exists and would
+            # have summarised fine thirty seconds later.
+            attempts = failures.get(accession, 0) + 1
+            failures[accession] = attempts
+            if attempts < MAX_FETCH_ATTEMPTS:
+                log.warning(
+                    f"No text for {ticker} {accession} "
+                    f"(attempt {attempts}/{MAX_FETCH_ATTEMPTS}) — retrying next cycle"
+                )
+            else:
+                seen.add(accession)
+                failures.pop(accession, None)
+                url = (f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+                       f"{accession.replace('-', '')}/{accession}-index.htm")
+                log.error(
+                    f"Giving up on {ticker} {accession} after "
+                    f"{MAX_FETCH_ATTEMPTS} failed fetches — {url}"
+                )
+                notify_failure(
+                    f"❌ **{ticker}** | {hit['form_type']} | {hit['file_date']}\n"
+                    f"Could not fetch this filing from EDGAR after "
+                    f"{MAX_FETCH_ATTEMPTS} attempts, so it was never summarised.\n"
+                    f"Manual review: <{url}>\n`{accession}`"
+                )
+                save_seen(seen)
+            save_fetch_failures(failures)
             continue
+
+        seen.add(accession)
+        if failures.pop(accession, None):
+            save_fetch_failures(failures)
 
         write_filing_payload(hit, ticker, filing_text, doc_urls)
         queued += 1

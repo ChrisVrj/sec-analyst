@@ -393,12 +393,20 @@ edgar_poller.time.sleep = lambda *_: None
 try:
     _requested.clear()
     hits = edgar_poller.fetch_recent_filings(max_pages=1)
-    check("one page of 6 role-entries is 3 filings", len(hits) == 3, f"got {len(hits)}")
-    check("only page 0 was requested", _requested == [0], f"got {_requested}")
+    check("every role survives the walk", len(hits) == 6, f"got {len(hits)}")
+    check("…covering 3 distinct filings",
+          len({h["accession"] for h in hits}) == 3)
+    check("…with both CIKs kept for each",
+          {h["cik"] for h in hits if h["accession"] == "0000000000-26-000000"}
+          == {"111", "222"},
+          "collapsing to one role is what dropped the watchlist company")
+    check("an identical role is still deduplicated",
+          len(edgar_poller.fetch_recent_filings(max_pages=1)) == 6)
+    check("only page 0 was requested", _requested[:1] == [0], f"got {_requested}")
 
     _requested.clear()
     hits = edgar_poller.fetch_recent_filings(max_pages=5)
-    check("paging continues past page 0", len(hits) == 5, f"got {len(hits)}")
+    check("paging continues past page 0", len(hits) == 8, f"got {len(hits)}")
     check("an empty page stops the walk", _requested == [0, 100, 200, 300],
           f"got {_requested}")
     check("newest first is preserved", hits[0]["accession"] == "0000000000-26-000000")
@@ -412,7 +420,7 @@ try:
     check("the horizon stops the walk well before the 40-page ceiling",
           _requested == [0, 100, 200], f"got {_requested}")
     check("the page that crosses the horizon is still kept",
-          len(hits) == 5, f"got {len(hits)}")
+          len(hits) == 8, f"got {len(hits)}")
 
     # Page 0 spans 20:00-20:02, so a 20:01 horizon is reached on that page.
     _requested.clear()
@@ -423,6 +431,126 @@ try:
 finally:
     edgar_poller._fetch_feed_page = _real_fetch_page
     edgar_poller.time.sleep = _real_sleep
+
+
+# ---------------------------------------------------------------------------
+# Tender offers page from the payload — 2026-09-01.
+#
+# NFJ's SC TO-I (0001193125-26-377910, a Virtus CEF self-tender) went
+# unposted. triage.py scored it 0: tender offers are tier 4 in URGENT_RULES,
+# but no form in TENDER_FORMS existed, so a Schedule TO reached #sec-urgent
+# only when the model happened to write a "## TENDER" block. That is the same
+# dependence on the model's wording that lost CLM.
+# ---------------------------------------------------------------------------
+print("\ntender offers")
+
+for form in ("SC TO-I", "SC TO-T", "SC 14D9", "SC 13E3"):
+    check(f"{form} pages on the form type alone",
+          triage.triage_filing(form, "routine text", "A Fund")[0] == 4,
+          "a Schedule TO is a standing bid at a stated price with an expiry")
+check("an amended Schedule TO still pages",
+      triage.triage_filing("SC TO-I/A", "routine text", "A Fund")[0] == 4,
+      "an amendment is usually a price bump or an extension, not old news")
+check("an 8-K is not a tender offer",
+      triage.triage_filing("8-K", "routine text", "A Corp")[0] == 0)
+check("triage can only promote, so a tender still routes urgent with no header",
+      dispatch.classify_priority(
+          "\U0001F4CB **NFJ | SC TO-I | 2026-09-01** \u2014 Virtus fund offers "
+          "to purchase shares.\nCompany: Virtus Dividend, Interest & Premium "
+          "Strategy Fund",
+          "SC TO-I")[0] == 0
+      and triage.triage_filing("SC TO-I", "", "")[0] == 4,
+      "classify_priority scores the wording; triage scores the filing")
+
+
+# ---------------------------------------------------------------------------
+# One filing, one decision — 2026-09-01.
+#
+# The feed gives a filing one entry per ROLE, each with its own CIK, and only
+# one of them names the watchlist company: a Form 4 lists the insider first
+# and the issuer second, a bank shelf lists the funding subsidiary first and
+# the guarantor second. poll_once() marked the ACCESSION seen on the first
+# role, so the matching role was skipped before it was ever examined.
+#
+# Measured against a 600-entry feed sample on 2026-09-01: of 119 multi-role
+# filings touching the watchlist, 114 had the watchlist CIK in the second
+# entry. One of them was a Saba Form 4 on ECF — the activist surveillance
+# this project exists for.
+# ---------------------------------------------------------------------------
+print("\nrole selection and fetch retries")
+
+WATCHLIST = {"793040": "ECF", "1260563": "NFJ"}
+
+SABA_FORM4 = [
+    # Order as the feed serves it: reporting person first, issuer second.
+    _fake_entry("0001510281-26-000999", "1510281", "4",
+                "2026-09-01T12:00:00-04:00", "Reporting"),
+    _fake_entry("0001510281-26-000999", "793040", "4",
+                "2026-09-01T12:00:00-04:00", "Issuer"),
+]
+
+
+def _run_poll(entries, seen=None, fetch_text="Saba Capital acquired shares."):
+    """poll_once against a stubbed feed and a stubbed document fetch."""
+    queued_hits = []
+    real = (edgar_poller.fetch_recent_filings,
+            edgar_poller.fetch_filing_documents,
+            edgar_poller.write_filing_payload,
+            edgar_poller.save_seen,
+            edgar_poller.load_fetch_failures,
+            edgar_poller.save_fetch_failures,
+            edgar_poller.notify_failure)
+    store: dict = {}
+    notices: list[str] = []
+    edgar_poller.fetch_recent_filings = lambda **kw: list(entries)
+    edgar_poller.fetch_filing_documents = lambda a, c: (fetch_text, ["u"] if fetch_text else [])
+    edgar_poller.write_filing_payload = lambda hit, t, txt, u: queued_hits.append((t, hit["cik"]))
+    edgar_poller.save_seen = lambda s: None
+    edgar_poller.load_fetch_failures = lambda: store
+    edgar_poller.save_fetch_failures = lambda f: store.update(f)
+    edgar_poller.notify_failure = lambda m: notices.append(m)
+    try:
+        out_seen, n = edgar_poller.poll_once(seen if seen is not None else set(), WATCHLIST)
+    finally:
+        (edgar_poller.fetch_recent_filings, edgar_poller.fetch_filing_documents,
+         edgar_poller.write_filing_payload, edgar_poller.save_seen,
+         edgar_poller.load_fetch_failures, edgar_poller.save_fetch_failures,
+         edgar_poller.notify_failure) = real
+    return queued_hits, out_seen, n, store, notices
+
+
+queued, _, n, _, _ = _run_poll(SABA_FORM4)
+check("a watchlist company in the SECOND role is still queued",
+      queued == [("ECF", "793040")], f"got {queued}")
+check("…exactly once", n == 1, f"got {n}")
+
+queued, _, _, _, _ = _run_poll(list(reversed(SABA_FORM4)))
+check("role order does not change the outcome",
+      queued == [("ECF", "793040")], f"got {queued}")
+
+queued, _, _, _, _ = _run_poll([
+    _fake_entry("0009999999-26-000001", "1665650", "424B2",
+                "2026-09-01T12:00:00-04:00", "Filer"),
+    _fake_entry("0009999999-26-000002", "1665650", "424B2",
+                "2026-09-01T12:00:00-04:00", "Filer"),
+])
+check("a filing with no watchlist role is still ignored", queued == [], f"got {queued}")
+
+# EDGAR 503s and serves incomplete index pages in the seconds after a filing
+# appears — which is when a 15-second poll first asks for it. Marking it seen
+# there was a permanent, silent loss of a filing that exists.
+queued, seen_after, _, store, notices = _run_poll(SABA_FORM4, fetch_text="")
+check("a failed fetch does NOT mark the filing seen",
+      "0001510281-26-000999" not in seen_after,
+      "it would never be looked at again")
+check("…and the attempt is counted",
+      store.get("0001510281-26-000999") == 1, f"got {store}")
+check("…with nothing queued", queued == [], f"got {queued}")
+check("…and no premature alert", notices == [])
+
+check("the retry budget is bounded",
+      edgar_poller.MAX_FETCH_ATTEMPTS > 1 and edgar_poller.MAX_FETCH_ATTEMPTS <= 10,
+      f"MAX_FETCH_ATTEMPTS={edgar_poller.MAX_FETCH_ATTEMPTS}")
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,22 @@ A gap in GitHub's cron now costs latency, not the filing. `--max-queue`
 (default 40) bounds a cold start after a lost cache; anything past the cap is
 named in `edgar_poller.log` rather than silently dropped.
 
+**One filing, one decision.** The feed gives a filing one entry per *role*,
+each carrying its own CIK — a Form 4 lists the insider first and the issuer
+second; a bank shelf lists the funding subsidiary first and the guarantor
+second. Deciding on the first entry and marking the whole accession seen threw
+away the role that names your company. In one 600-entry sample, **114 of the
+119 multi-role filings touching the watchlist had the watchlist CIK in the
+second entry** — including a Saba Form 4 on ECF. Roles are now kept through the
+feed walk and the watchlist role is the one that decides.
+
+**A failed fetch is retried, not written off.** EDGAR returns 503s and read
+timeouts under normal load, and an index page is not always complete in the
+seconds after a filing appears — which is exactly when a 15-second poll first
+asks for it. Such a filing used to be marked seen and never looked at again.
+It is now retried for `MAX_FETCH_ATTEMPTS` cycles, and giving up posts a ❌ to
+Discord with the EDGAR link instead of a line in a log nobody opens.
+
 The LLM is **NVIDIA Nemotron 3** via NVIDIA NIM (free, ~40 req/min, no daily
 cap), with **OpenRouter free models as an automatic fallback**.
 
@@ -199,6 +215,10 @@ its own tier-2 rule (🧨) and is deliberately **not** gated: shares outstanding
 rise on a fixed date at a price struck off NAV, so a fund trading at a premium
 gives that premium up. It would fail the retail-income test by construction,
 which is exactly why the test does not apply to it.
+
+Tender offers (`SC TO-I`, `SC TO-T`, `SC 14D9`, `SC 13E3`) page on the form
+type alone, amendments included — a Schedule TO is a standing bid at a stated
+price with an expiry, and an amended one is usually a price bump.
 
 **Two independent guards, pulling in opposite directions.** `triage.py` reads
 `form_type` and `filing_text` — the EDGAR payload, which does not vary with
