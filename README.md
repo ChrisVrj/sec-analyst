@@ -250,9 +250,22 @@ most, and both are tuned against real filings:
 | Dropped | Signal |
 |---|---|
 | Form 3/4/5 from anyone but a tracked activist | filer name |
+| Form 144 from anyone but a tracked activist | filer name |
 | Structured notes (autocallable, buffer, participation rate, underlier) | payoff vocabulary |
 | Explicitly unlisted offerings | "will not be listed…", and the term-sheet field `Listing: None` |
 | $1,000-and-up paper | a stated `Denominations: $1,000` / `Minimum Denomination: $1,000`, with no $25-par or depositary-share signal anywhere |
+
+**Form 144 is gated like Form 4, not dropped like N-PX.** A 144 is a *notice
+of intent* — an affiliate proposing to sell common stock, above 5,000 shares or
+$50,000 in three months. It is not a transaction: the sale may be partial or
+may never happen, and when it happens a Section 16 insider reports it on a
+Form 4 within two business days. Keeping the 144 while skipping the Form 4
+made no sense. The one 144 worth a token is an activist's, because an
+affiliate files it *before* selling — the earliest obtainable warning of an
+unwind. These only started arriving in Sep 2026: the feed emits a 144 as
+`(Reporting)` for the insider and `(Subject)` for the issuer, and until the
+role fix the first entry missed the watchlist and took the accession with it.
+They were being dropped by accident; now they are dropped by rule.
 
 **Rights offerings are kept unconditionally**, checked before everything else.
 A CEF rights prospectus runs 250–300k characters of fund boilerplate, and

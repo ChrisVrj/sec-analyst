@@ -10,7 +10,8 @@ reference it; treat "openrouter" in the filename as historical.
 Pipeline:
   1. Read all *.json filing payloads from filings-inbox/
   2. Pre-filter each filing against prefilter.should_skip (drops Form 3/4/5
-     from non-activists and unlisted/structured 424B & FWP offerings)
+     and Form 144 from non-activists, N-PX, and unlisted/structured 424B &
+     FWP offerings)
   3. For surviving filings, call the LLM with the sec-analyst prompt
   4. Post the structured summary to Discord via webhook
   5. Move processed filings to filings-inbox/processed/

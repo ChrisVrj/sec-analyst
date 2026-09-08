@@ -1,14 +1,15 @@
 """
 prefilter.py — drop noise filings before the LLM call.
 
-Three filters:
+Four filters:
   1. Form 3/4/5 ownership filings: skip unless the filer matches a tracked
      activist (Saba, Bulldog, Karpus, RiverNorth, etc.).
-  2. 424B / FWP offerings: skip retail structured notes (autocallable,
+  2. Form 144 proposed-sale notices: same activist gate. See below.
+  3. 424B / FWP offerings: skip retail structured notes (autocallable,
      contingent coupon, market-linked, etc.) AND unlisted bank senior notes
      ($1k denomination, no exchange listing — Citi/JPM/BAC/RBC etc.).
      Keep only offerings that explicitly mention listing on NYSE / NASDAQ.
-  3. Form N-PX proxy voting records: skip unconditionally. See below.
+  4. Form N-PX proxy voting records: skip unconditionally. See below.
 
 Edit the lists below to tune. Matching is substring, case-insensitive.
 
@@ -325,6 +326,40 @@ RETAIL_PAR_SIGNALS: list[str] = [
 
 
 OWNERSHIP_FORMS: set[str] = {"3", "4", "5", "3/A", "4/A", "5/A"}
+
+# ---------------------------------------------------------------------------
+# Proposed-sale notices — Sep 2026: 144s started arriving in #sec-filings in
+# bulk (AEP, PG&E, Equitable, Bridgewater Bancshares in a single afternoon).
+#
+# Nothing changed at EDGAR. The role fix in da7a5a6 is what opened the tap:
+# the feed emits a 144 as two entries, "(Reporting)" for the insider and
+# "(Subject)" for the issuer, and the watchlist CIK is on the SECOND one.
+# Until that commit the first role missed the watchlist and took the whole
+# accession down with it, so these were being dropped by accident. They are
+# now dropped on purpose.
+#
+# A Form 144 is a NOTICE OF INTENT, filed by an affiliate when a proposed sale
+# of restricted or control stock will exceed 5,000 shares or $50,000 in any
+# three months. It is not a transaction. The sale may be partial, may be
+# priced anywhere, may never happen — and when it does happen, a Section 16
+# insider (which is nearly every 144 filer) reports it on a Form 4 within two
+# business days. So a 144 is a weaker, earlier draft of a filing this module
+# already gates behind ACTIVIST_FILERS. Keeping the 144 while skipping the
+# Form 4 is incoherent.
+#
+# It is also always the wrong asset class. A 144 covers common stock sold
+# under Rule 144; the mandate in openrouter_dispatch.py is exchange-traded
+# income securities. The posts that prompted this said so themselves, in the
+# body, unprompted: "No preferred stock, baby bonds, or exchange-traded debt
+# are referenced in this filing."
+#
+# Gated rather than dropped outright, unlike N-PX. An activist that is an
+# affiliate must file the 144 BEFORE it sells, which makes it the earliest
+# obtainable warning of an unwind — ahead of the Form 4 that §3 exists to
+# catch. is_activist_filer() reads entity_name + filing_text, and the filer's
+# name is in the body of the 144 even when the matched role is the issuer.
+PROPOSED_SALE_FORMS: set[str] = {"144", "144/A"}
+
 OFFERING_FORMS: set[str] = {
     "424B1", "424B2", "424B3", "424B4", "424B5", "424B7", "424B8", "FWP",
 }
@@ -487,7 +522,18 @@ def should_skip(filing: dict) -> tuple[bool, str]:
             return True, f"Form {form_type} not from tracked activist"
         return False, ""
 
-    # 2) 424B / FWP — skip unlisted structured products and unlisted senior notes
+    # 2) Form 144 — a notice that an affiliate intends to sell common stock.
+    #    Same activist gate as Form 4, because it is the same event seen
+    #    earlier and less reliably: the sale reaches Form 4 within two
+    #    business days if it happens at all.
+    if form_type in PROPOSED_SALE_FORMS:
+        if not is_activist_filer(filing):
+            return True, (f"Form {form_type} proposed common-stock sale, not "
+                          f"from a tracked activist — the executed sale "
+                          f"arrives on a Form 4")
+        return False, ""
+
+    # 3) 424B / FWP — skip unlisted structured products and unlisted senior notes
     if form_type in OFFERING_FORMS:
         skip, why = is_unlisted_offering(filing)
         if skip:

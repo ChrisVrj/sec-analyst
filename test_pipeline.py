@@ -113,6 +113,73 @@ check(
 
 
 # ---------------------------------------------------------------------------
+# prefilter / Form 144 — Sep 2026: 144s flooded #sec-filings the afternoon
+# after da7a5a6. The feed emits a 144 as "(Reporting)" for the insider and
+# "(Subject)" for the issuer; the watchlist CIK is on the second entry, so
+# until the role fix these were dropped by accident rather than by rule.
+#
+# A 144 is a notice that an affiliate INTENDS to sell common stock. The sale
+# itself lands on a Form 4 within two business days, and Form 4 is already
+# gated behind ACTIVIST_FILERS — so the two must be gated the same way.
+# Real accessions: 0001968564-26-000006 (BWB), 0001921094-26-000996 (PCG).
+# ---------------------------------------------------------------------------
+
+check(
+    "Form 144 from an ordinary insider is skipped",
+    prefilter.should_skip({
+        "form_type": "144", "entity_name": "BRIDGEWATER BANCSHARES INC",
+        "filing_text": ("Douglas J. Parish, Director. 4,000 shares of common "
+                        "stock to be sold through D.A. Davidson & Co. on "
+                        "09/08/2026. Nature of acquisition: open market."),
+    })[0],
+)
+
+check(
+    "Form 144/A is skipped too",
+    prefilter.should_skip({"form_type": "144/A", "entity_name": "PG&E CORP",
+                           "filing_text": "Amended notice of proposed sale."})[0],
+)
+
+check(
+    "Form 144 from a tracked activist is kept",
+    not prefilter.should_skip({
+        "form_type": "144", "entity_name": "EATON VANCE SENIOR FLOATING RATE TRUST",
+        "filing_text": ("Saba Capital Management, L.P. proposes to sell "
+                        "1,200,000 common shares."),
+    })[0],
+    "an affiliate files the 144 before it sells — earliest warning of an unwind",
+)
+
+check(
+    "the 144 skip reason names the form, for dispatch.log",
+    "144" in prefilter.should_skip({"form_type": "144", "filing_text": ""})[1],
+)
+
+check(
+    "the issuer's own name in the Subject role does not rescue a 144",
+    prefilter.should_skip({
+        "form_type": "144", "entity_name": "AMERICAN ELECTRIC POWER CO INC",
+        "filing_text": ("Kate Dixon. 1,000 shares of AEP common stock. "
+                        "Acquired 05/22/2026 by vesting of restricted stock."),
+    })[0],
+    "the watchlist match is the issuer, not evidence the filing is relevant",
+)
+
+check(
+    "a 10-K is not caught by the 144 rule",
+    not prefilter.should_skip({"form_type": "10-K", "entity_name": "Equitable Holdings",
+                               "filing_text": "Annual report."})[0],
+)
+
+check(
+    "'144' inside another form type is not matched",
+    not prefilter.should_skip({"form_type": "S-1", "entity_name": "Some CEF",
+                               "filing_text": "Rule 144 restricted securities."})[0],
+    "the gate is on form_type, not on the text mentioning Rule 144",
+)
+
+
+# ---------------------------------------------------------------------------
 # prefilter / N-PX — Aug 2026: five proxy voting records reached #sec-filings
 # in twenty minutes on the night of the 21st. Each one reports how a fund
 # voted OTHER issuers' proxies through the previous 30 June; the proposals
