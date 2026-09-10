@@ -48,6 +48,8 @@ being watched.
 import logging
 import re
 
+from prefilter import is_document_maintenance, unlisted_statement
+
 log = logging.getLogger("DISPATCH")
 
 # Tiers match URGENT_RULES in openrouter_dispatch.py. Lower is more urgent;
@@ -240,6 +242,21 @@ def triage_filing(form_type, filing_text="", entity_name=""):
         notes.append(describe_targets(targets))
         return TIER_REDEMPTION, "redemption (filing text)", notes
 
+    # A supplement that discloses no event cannot be urgent on any form.
+    # prefilter drops these before the LLM call, but only on 424B / FWP —
+    # this is the routing layer saying the same thing independently, so a
+    # maintenance supplement filed on some other form cannot page either.
+    #
+    # Placed below the redemption check on purpose. is_document_maintenance()
+    # vetoes itself on redemption language, but the module's precedence is
+    # that a redemption outranks everything, and it should not depend on
+    # another module's veto list staying as broad as this one's.
+    maintenance, why = is_document_maintenance(
+        {"filing_text": text, "entity_name": entity_name})
+    if maintenance:
+        notes.append(f"{base_form} {why}")
+        return TIER_NONE, "", notes
+
     if base_form in TENDER_FORMS:
         notes.append(
             f"{base_form} is a standing bid for an outstanding security"
@@ -256,6 +273,32 @@ def triage_filing(form_type, filing_text="", entity_name=""):
             # The announcement already went out weeks ago; this sets a date.
             notes.append(f"{base_form}/A amendment — announcement already made")
             return TIER_NONE, "", notes
+        # An offering that says outright it will never trade is not urgent,
+        # whatever form it arrived on.
+        #
+        # Sep 2026: six JPMorgan 424B3s pinged #sec-urgent carrying bodies
+        # that read "Listing: UNLISTED". Both halves of the router agreed
+        # they were routine — classify_priority() demotes an unlisted tier 2
+        # by design — and they paged anyway, because this function scores
+        # every 424B* a tier 2 on form type and can only promote. The
+        # summary-side gate has therefore been dead on 424B filings for as
+        # long as both have existed.
+        #
+        # This is NOT the gate that silenced CLM, and the difference is the
+        # whole reason it is safe. That one demanded POSITIVE evidence of a
+        # retail income security, which a rights offering — common stock —
+        # can never produce. This demands the issuer's own unhedged statement
+        # that the thing will not be listed, the same signal prefilter treats
+        # as decisive, and it does not run on a rights offering at all.
+        # CLM's N-2 contains no such sentence and is caught by is_rights
+        # first; SAR's 424B2 says it will list as SAX and never reaches here,
+        # because a redemption already returned tier 1 above.
+        if not is_rights:
+            unlisted = unlisted_statement(text)
+            if unlisted:
+                notes.append(f"{base_form} states {unlisted!r} — nothing to "
+                             f"trade, so not urgent on form type alone")
+                return TIER_NONE, "", notes
         notes.append(f"{base_form} registers or prices new securities")
         return TIER_NEW_ISSUE, "new issuance (form type)", notes
 

@@ -1,15 +1,18 @@
 """
 prefilter.py — drop noise filings before the LLM call.
 
-Four filters:
+Five filters:
   1. Form 3/4/5 ownership filings: skip unless the filer matches a tracked
      activist (Saba, Bulldog, Karpus, RiverNorth, etc.).
   2. Form 144 proposed-sale notices: same activist gate. See below.
-  3. 424B / FWP offerings: skip retail structured notes (autocallable,
+  3. 424B / FWP document-maintenance supplements: index supplements and
+     prospectus addenda, which are filed on offering forms but offer
+     nothing. See is_document_maintenance().
+  4. 424B / FWP offerings: skip retail structured notes (autocallable,
      contingent coupon, market-linked, etc.) AND unlisted bank senior notes
      ($1k denomination, no exchange listing — Citi/JPM/BAC/RBC etc.).
      Keep only offerings that explicitly mention listing on NYSE / NASDAQ.
-  4. Form N-PX proxy voting records: skip unconditionally. See below.
+  5. Form N-PX proxy voting records: skip unconditionally. See below.
 
 Edit the lists below to tune. Matching is substring, case-insensitive.
 
@@ -325,6 +328,70 @@ RETAIL_PAR_SIGNALS: list[str] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Document-maintenance supplements — Sep 2026: six JPMorgan 424B3s reached
+# #sec-urgent inside four minutes on the 10th, each one an LLM call, a ping
+# and three paragraphs of the model explaining why it had nothing to say.
+#
+# They are not offerings. A 424B3 is the form a bank uses for a supplement
+# that prices nothing, and two kinds of it arrive in bulk:
+#
+#   · INDEX SUPPLEMENT. A monthly republication of an index's backtested and
+#     actual return table — "MerQube US Gold Vol Advantage Index", "J.P.
+#     Morgan Multi-Asset Index". The subject is an INDEX, not a security. No
+#     issuance, no coupon, no listing, no par; the body is a grid of monthly
+#     percentages back to 1999.
+#
+#   · PROSPECTUS ADDENDUM. A notice that some earlier document's references
+#     have been re-pointed at a refreshed shelf — "all references in the
+#     prospectus supplement to the prospectus dated November 16, 2020 should
+#     refer instead to the accompanying prospectus dated April 8, 2026". It
+#     exists so dealers can keep using old pricing supplements in
+#     market-making. It creates, retires and reprices nothing.
+#
+# Neither can be caught by the checks above, and that is not an oversight in
+# them: every signal in this module describes the SECURITY BEING OFFERED, and
+# these documents offer no security. All six went through untouched.
+#
+# The volume is the reason this is worth its own rule. JPM alone has 23,744
+# 424B filings in EDGAR's recent window, MS 16,581, BAC 10,547, RY 3,577. In
+# a 67-filing sample across those four issuers the existing filters caught
+# every 424B2 pricing supplement — 40 of 40 — and none of the 424B3s: 20
+# leaked, 18 of them these two classes.
+#
+# ⚠ Matched on the COVER, and on the document's own title for itself, not on
+# a passing mention. A pricing supplement's cover stack routinely lists "the
+# index supplement dated April 17, 2026" among its accompanying documents;
+# what it never does is call ITSELF one. Measured first-occurrence offsets in
+# the sample: index supplement 42 in all eight JPM filings, prospectus
+# addendum 113-129 (MS) and 558-613 (BAC). Across 75 documents — 40 real bank
+# pricing supplements, 18 of these, RIV's and NMCO's rights offerings, SAR's
+# baby bond, and Gladstone / Hercules / Oxford Square note and ATM
+# supplements — these two patterns matched all 18 and nothing else.
+# ---------------------------------------------------------------------------
+INDEX_SUPPLEMENT_RE = re.compile(
+    r"index\s+supplement\s+to\s+the\s+prospectus", re.I,
+)
+PROSPECTUS_ADDENDUM_RE = re.compile(
+    r"(?:this\s+)?prospectus\s+addendum\s+(?:to\s+the|supplements)", re.I,
+)
+
+# Same 4,000-character cover window as RIGHTS_COVER_CHARS, for the same
+# reason: a document says what it is on its first page.
+MAINTENANCE_COVER_CHARS = 4_000
+
+# A maintenance document has no event in it by construction, so any of these
+# appearing means the classification is wrong and the filing must survive.
+# Cheap insurance against the two losses this module has already taken.
+MAINTENANCE_VETO: list[str] = [
+    "notice of redemption",
+    "rights offering",
+    "subscription rights",
+    "will be redeemed",
+    "has been called for redemption",
+]
+
+
 OWNERSHIP_FORMS: set[str] = {"3", "4", "5", "3/A", "4/A", "5/A"}
 
 # ---------------------------------------------------------------------------
@@ -417,6 +484,43 @@ def is_rights_offering(filing: dict) -> bool:
     cover = text[:RIGHTS_COVER_CHARS]
     return (any(sig in cover for sig in RIGHTS_OFFERING_SIGNALS)
             and any(term in text for term in RIGHTS_OFFER_TERMS))
+
+
+def is_document_maintenance(filing: dict) -> tuple[bool, str]:
+    """Returns (skip, reason) for a supplement that discloses no event.
+
+    An index supplement republishes an index's return table; a prospectus
+    addendum re-points an older document's references at a refreshed shelf.
+    Both are filed on offering forms and neither offers, prices, retires or
+    reprices anything.
+
+    The test is what the document calls ITSELF, on its cover. That matters:
+    a real pricing supplement lists the index supplement among its
+    accompanying documents, so a bare mention of the phrase is worthless as a
+    signal and only its self-description will do.
+
+    Any redemption or rights language vetoes the whole classification. A
+    maintenance document cannot contain either, so their presence means this
+    read is wrong — and those are precisely the two events whose loss this
+    module has paid for before.
+    """
+    text  = filing.get("filing_text", "") or ""
+    cover = text[:MAINTENANCE_COVER_CHARS]
+
+    if INDEX_SUPPLEMENT_RE.search(cover):
+        kind = "index supplement — an index return table, no security offered"
+    elif PROSPECTUS_ADDENDUM_RE.search(cover):
+        kind = ("prospectus addendum — re-points an earlier document at a "
+                "refreshed shelf, nothing offered or repriced")
+    else:
+        return False, ""
+
+    lower = text.lower()
+    veto = next((v for v in MAINTENANCE_VETO if v in lower), None)
+    if veto:
+        return False, ""
+
+    return True, kind
 
 
 def is_institutional_denomination(filing: dict) -> tuple[bool, str]:
@@ -535,6 +639,13 @@ def should_skip(filing: dict) -> tuple[bool, str]:
 
     # 3) 424B / FWP — skip unlisted structured products and unlisted senior notes
     if form_type in OFFERING_FORMS:
+        # A supplement that discloses no event is dropped before anything
+        # tries to read an offering out of it. Its own veto list covers the
+        # rights and redemption language that would mean this read is wrong.
+        maint, why = is_document_maintenance(filing)
+        if maint:
+            return True, f"{form_type} {why}"
+
         skip, why = is_unlisted_offering(filing)
         if skip:
             return True, f"{form_type} {why}"
