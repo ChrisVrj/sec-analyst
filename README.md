@@ -220,6 +220,24 @@ Tender offers (`SC TO-I`, `SC TO-T`, `SC 14D9`, `SC 13E3`) page on the form
 type alone, amendments included — a Schedule TO is a standing bid at a stated
 price with an expiry, and an amended one is usually a price bump.
 
+That gate has one blind spot worth naming: it reads *positive* evidence, so a
+summary that recites the reader's universe in order to **deny** it used to
+clear it. *"...not a retail-denominated preferred stock, baby bond, or
+exchange-traded debt"* contains three retail signals and means the opposite of
+all three. A retail match now only counts when nothing negates it in the same
+clause — one un-negated mention is enough, so *"not common stock; they are $25
+par baby bonds"* is unaffected.
+
+**An offering that says it will never trade is not urgent, on any form.** The
+filing-side guard scored every `424B*` a tier 2 on form type and can only
+promote, so the tradeable gate above had been dead on 424B filings for as long
+as both existed — six JPMorgan supplements pinged on 2026-09-10 with
+`Listing: UNLISTED` in the visible body and both halves of the router calling
+them routine. It now stands down when the issuer states, unhedged, that the
+security will not be listed. This is **not** the positive-evidence gate that
+silenced CLM: rights offerings are exempt, hedged shelf boilerplate does not
+count, and a redemption still outranks everything.
+
 **Two independent guards, pulling in opposite directions.** `triage.py` reads
 `form_type` and `filing_text` — the EDGAR payload, which does not vary with
 phrasing — and can only ever *promote*. `classify_priority()` reads the summary
@@ -233,6 +251,18 @@ the fallback chain first; if every model fails, the channel gets a ⚠️ alert
 with the EDGAR link rather than the model's notes to itself. The check is
 anchored to the start of a line on purpose — the leaked post on 2026-09-01
 contained a perfectly well-formed headline quoted mid-sentence.
+
+**Prompt vocabulary is scrubbed, sentence by sentence.** `OUTPUT DISCIPLINE`
+tells the model to omit a highlight block silently, and it keeps explaining
+itself instead — six posts on 2026-09-10 had bodies made entirely of *"No
+highlighted trigger event (priority 1–4) is literally stated in the
+filing..."*. The older patterns missed that by inches: it says "highlighted
+trigger event", not "highlight block", and its "priority 1–4" uses an en dash.
+Phrases that exist only in the system prompt — `literally stated`, `the
+reader's universe`, `highlight block`/`highlighted trigger` — are dropped
+wherever they appear in prose, while structural lines, field lines and quotes
+are never touched. `trigger event` alone is deliberately not a pattern: a
+change-of-control trigger event is a real thing a real filing discloses.
 
 **Routing reads the message that gets posted, not the model's raw output.**
 Those are not the same string: the dispatcher drops a second summary copy,
@@ -251,9 +281,43 @@ most, and both are tuned against real filings:
 |---|---|
 | Form 3/4/5 from anyone but a tracked activist | filer name |
 | Form 144 from anyone but a tracked activist | filer name |
+| Index supplements and prospectus addenda | what the document calls itself on its cover |
 | Structured notes (autocallable, buffer, participation rate, underlier) | payoff vocabulary |
 | Explicitly unlisted offerings | "will not be listed…", and the term-sheet field `Listing: None` |
 | $1,000-and-up paper | a stated `Denominations: $1,000` / `Minimum Denomination: $1,000`, with no $25-par or depositary-share signal anywhere |
+
+**A 424B3 usually isn't an offering.** The banks file two kinds of supplement
+in bulk that price nothing at all:
+
+* an **index supplement** — a monthly republication of an index's backtested
+  return table (*MerQube US Gold Vol Advantage Index*, *J.P. Morgan
+  Multi-Asset Index*). The subject is an index, not a security.
+* a **prospectus addendum** — a notice that an older document's references now
+  point at a refreshed shelf, so dealers can keep using old pricing
+  supplements in market-making. It creates, retires and reprices nothing.
+
+Neither could be caught by the rules above, and that is not an oversight in
+them: every signal in the table describes *the security being offered*, and
+these documents offer no security. Six JPMorgan index supplements reached
+`#sec-urgent` on 2026-09-10 with an @mention each.
+
+The volume is why they earn their own rule. JPM has 23,744 424B filings in
+EDGAR's recent window, MS 16,581, BAC 10,547, RY 3,577. In a 67-filing sample
+across those four issuers, the older filters caught **40 of 40** 424B2 pricing
+supplements and **none** of the 424B3s; adding this rule takes the sample from
+20 filings reaching the LLM to 2.
+
+The match is on what the document calls **itself**, on its cover — a real
+pricing supplement routinely cites *"the index supplement dated April 17,
+2026"* among its accompanying documents, so a passing mention proves nothing.
+Any redemption or rights language vetoes the classification outright. Across
+75 documents — 40 real pricing supplements, RIV's and NMCO's rights offerings,
+SAR's baby bond, and Gladstone / Hercules / Oxford Square supplements — the
+two patterns matched all 18 maintenance filings and nothing else.
+
+Note what is *not* filtered: a genuine base shelf prospectus and a
+market-making prospectus (both BofA, both real prospectuses rather than
+maintenance notices) still come through. Shelf registrations are wanted loud.
 
 **Form 144 is gated like Form 4, not dropped like N-PX.** A 144 is a *notice
 of intent* — an affiliate proposing to sell common stock, above 5,000 shares or

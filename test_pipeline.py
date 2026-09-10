@@ -1297,6 +1297,216 @@ check("filing path promotes it, as now requested",
 
 
 # ---------------------------------------------------------------------------
+# Document-maintenance supplements — Sep 2026: six JPMorgan 424B3s reached
+# #sec-urgent inside four minutes on the 10th, each with an @mention, and each
+# body was three paragraphs of the model explaining that it had nothing to
+# report. Real accessions 0001213900-26-098518/519/520/538/567/568.
+#
+# Every layer failed on the same fact: these documents offer no security, and
+# every filter in prefilter.py describes a security being offered.
+#
+# Fixtures are the real cover text, verbatim from EDGAR.
+# ---------------------------------------------------------------------------
+print("\nprefilter — supplements that offer nothing")
+
+JPM_INDEX_SUPPLEMENT = (
+    "424B3 1 ea0305050-01_424b3.htm FORM 424B3 Index supplement to the "
+    "prospectus dated April 17, 2026, the prospectus supplement dated April "
+    "17, 2026, the product supplement no. 3 - I dated April 17, 2026 and the "
+    "underlying supplement no. 5 - I dated April 17, 2026 Registration "
+    "Statement Nos. 333 - 293684 Dated September 10, 2026 Rule 424(b)(3) "
+    "PERFORMANCE UPDATE The MerQube US Gold Vol Advantage Index attempts to "
+    "provide a dynamic rules - based exposure to an unfunded rolling position "
+    "in Gold futures. Hypothetical and actual historical performance: Aug "
+    "2016 through Aug 2026. Year Dec Nov Oct Sep 2008 37.69% - 12.41% 28.65%"
+)
+
+MS_PROSPECTUS_ADDENDUM = (
+    "424B3 1 dp244610_424b3-papssm.htm FORM 424B3 Filed Pursuant to Rule "
+    "424(b)(3) Registration Statement No. 333-293641 Prospectus Addendum to "
+    "the Prospectus dated April 8, 2026 SHARES OF FIXED-TO-FLOATING RATE "
+    "NON-CUMULATIVE PREFERRED STOCK, SERIES M You should read the "
+    "accompanying prospectus supplement, which gives the specific terms of "
+    "the offered shares. When you read the prospectus supplement, please note "
+    "that all references to the prospectus dated November 16, 2020 should "
+    "refer instead to the accompanying prospectus dated April 8, 2026."
+)
+
+BAC_PROSPECTUS_ADDENDUM = (
+    "424B3 1 d60234d424b3.htm 424B3 Filed pursuant to Rule 424(b)(3) Bank of "
+    "America Corporation Senior Medium-Term Notes, Series P When Bank of "
+    "America initially offered to sell you certain of its Senior Medium-Term "
+    "Notes, Series P, Bank of America prepared a preliminary pricing "
+    "supplement. This prospectus addendum supplements and amends the "
+    "preliminary pricing supplement(s) relating to the notes you have been "
+    "offered, each of which references a prospectus dated December 30, 2022."
+)
+
+for name, text in [("index supplement", JPM_INDEX_SUPPLEMENT),
+                   ("Morgan Stanley prospectus addendum", MS_PROSPECTUS_ADDENDUM),
+                   ("BofA prospectus addendum", BAC_PROSPECTUS_ADDENDUM)]:
+    skip, why = prefilter.should_skip(
+        {"form_type": "424B3", "entity_name": "BANK", "filing_text": text})
+    check(f"a {name} is dropped before the LLM call", skip, f"why={why!r}")
+
+# The MS addendum names Series M preferred stock — a security squarely in the
+# reader's universe. It still has to go, because the DOCUMENT discloses no
+# event about it: it only re-points a stale prospectus reference. Filtering on
+# what security is named would have kept this one.
+check("...even when the addendum names a preferred series",
+      prefilter.should_skip({"form_type": "424B3", "entity_name": "MORGAN STANLEY",
+                             "filing_text": MS_PROSPECTUS_ADDENDUM})[0])
+
+# The signal is what the document calls ITSELF, on its cover. A real pricing
+# supplement lists the index supplement among its accompanying documents, so a
+# bare mention of the phrase must not be enough to drop anything.
+PRICING_SUPPLEMENT_CITING_INDEX_SUPPLEMENT = (
+    "424B2 1 ea0304968-01_424b2.htm PRICING SUPPLEMENT JPMorgan Chase "
+    "Financial Company LLC September 2026 Pricing Supplement. Please read the "
+    "index supplement dated April 17, 2026 and the underlying supplement no. "
+    "5-I dated April 17, 2026. We are offering $25.00 per share of 6.50% "
+    "Series C Preferred Stock and have applied to list the depositary shares "
+    "on the New York Stock Exchange."
+)
+skip, why = prefilter.should_skip(
+    {"form_type": "424B2", "entity_name": "JPM",
+     "filing_text": PRICING_SUPPLEMENT_CITING_INDEX_SUPPLEMENT})
+check("a real offering that merely CITES an index supplement survives",
+      not skip, f"dropped as {why!r}")
+
+# The veto. A maintenance document cannot contain an event; if one appears,
+# the classification is wrong and silence is the expensive mistake.
+check("a redemption in the body vetoes the maintenance read",
+      not prefilter.should_skip(
+          {"form_type": "424B3", "entity_name": "BANK",
+           "filing_text": MS_PROSPECTUS_ADDENDUM
+                          + " The Company has issued a notice of redemption "
+                            "for all outstanding 6.00% 2027 Notes."})[0])
+check("rights-offering language vetoes it too",
+      not prefilter.should_skip(
+          {"form_type": "424B3", "entity_name": "FUND",
+           "filing_text": JPM_INDEX_SUPPLEMENT
+                          + " The Fund is conducting a rights offering."})[0])
+
+
+# ---------------------------------------------------------------------------
+# triage — the reason unlisted paper could reach #sec-urgent at all.
+#
+# Both halves of the router scored those six JPM filings routine. The bodies
+# read "Listing: UNLISTED" and classify_priority() demotes an unlisted tier 2
+# by design. They paged anyway: triage_filing() scored every 424B* a tier 2 on
+# form type, and it can only promote — so the summary-side tradeable gate had
+# been dead on 424B filings for as long as both existed.
+#
+# The fix demotes only on the issuer's own unhedged statement that the thing
+# will not list. It is NOT the positive-evidence gate that silenced CLM: a
+# rights offering is exempt, and CLM's N-2 contains no such sentence anyway.
+# ---------------------------------------------------------------------------
+print("\ntriage — an offering that will never trade is not urgent")
+
+check("a 424B2 that says it will not be listed no longer pages",
+      triage_filing("424B2", "We are offering senior notes due 2031. The notes "
+                             "will not be listed on any securities exchange.")[0] == 0)
+check("an S-3 that says the same no longer pages",
+      triage_filing("S-3", "Registration of medium-term notes. We do not intend "
+                           "to list the notes on any exchange.")[0] == 0)
+
+# The hedge still holds. "Unless we inform you otherwise..." is base-prospectus
+# boilerplate about a security class, not a statement about this offering —
+# the AGNC / Rithm failure mode, and the reason unlisted_statement() exists.
+check("hedged shelf boilerplate does not demote a shelf takedown",
+      triage_filing("424B5",
+                    "Unless we inform you otherwise in the applicable prospectus "
+                    "supplement, the debt securities will not be listed on any "
+                    "securities exchange. We are offering common stock.")[0] == 2)
+
+# The RIV failure mode, one layer up. A CEF rights prospectus carries a line
+# about preferred shares that may not be listed at first; it must not silence
+# the offer.
+check("a rights offering is exempt from the unlisted demotion",
+      triage_filing("424B2",
+                    "The Fund is issuing transferable subscription rights. Rights "
+                    "offering. The preferred shares will not be listed on any "
+                    "securities exchange during the first 30 days.")[0] == 2)
+
+check("CLM still pages — the gate that silenced it is not back",
+      triage_filing("N-2", CLM_N2_TEXT)[0] == 2)
+check("SAX still pages on its redemption",
+      triage_filing("424B2", SAX_TEXT)[0] == 1)
+check("a maintenance supplement cannot page on any form",
+      triage_filing("424B3", JPM_INDEX_SUPPLEMENT)[0] == 0)
+check("a redemption still outranks the maintenance read",
+      triage_filing("424B3", MS_PROSPECTUS_ADDENDUM
+                    + " The Company has issued a notice of redemption for all "
+                      "outstanding 6.00% 2027 Notes.")[0] == 1)
+
+
+# ---------------------------------------------------------------------------
+# The summary itself. Every one of those six posts had a body made entirely of
+# the model reciting SYSTEM_PROMPT back — the one thing OUTPUT DISCIPLINE
+# forbids. The old scrubbers missed it by inches: "highlighted trigger event"
+# is not "highlight block", and "priority 1-4" was written with an EN DASH,
+# which `(to|through|-)` does not match.
+#
+# It was also a routing bug. The middle sentence recites the reader's universe
+# in order to DENY it, and "preferred stock, baby bond, or exchange-traded
+# debt" is exactly what _RETAIL_SECURITY hunts for — so the model saying a
+# filing is NOT a preferred stock cleared the tier-2 gate.
+# ---------------------------------------------------------------------------
+print("\nsummaries — the model's working-out, verbatim from the 10th")
+
+JPM_META_BODY = (
+    "\U0001F4E2 **n/d | 424B3 | 2026-09-10** \u2014 JPMorgan Chase & Co. files a "
+    "prospectus supplement updating historical returns for the S&P 500 Daily "
+    "Risk Control 10% Index through August 2026.\n"
+    "Company: JPMORGAN CHASE & CO\n\n"
+    "No highlighted trigger event (priority 1\u20134) is literally stated in the "
+    "filing. The document provides only backtested index performance data.\n\n"
+    "The filing describes a structured product linked to an index, not a "
+    "retail-denominated preferred stock, baby bond, or exchange-traded debt.\n\n"
+    "The update is for informational purposes only and does not relate to a "
+    "newly listed or modified security in the reader\u2019s universe."
+)
+
+scrubbed = dispatch.render_body(JPM_META_BODY, 1900)
+check("the 'no highlighted trigger event' sentence is dropped",
+      "highlighted trigger" not in scrubbed, scrubbed)
+check("an en-dashed 'priority 1-4' is caught like a hyphenated one",
+      "literally stated" not in scrubbed, scrubbed)
+check("'the reader's universe' is dropped as prompt vocabulary",
+      "reader" not in scrubbed.lower(), scrubbed)
+check("the headline survives the scrub",
+      dispatch.looks_like_summary(scrubbed), scrubbed)
+
+check("the post no longer pings on a negated universe recital",
+      dispatch.classify_priority(scrubbed, "424B3")[0] == 0,
+      str(dispatch.classify_priority(scrubbed, "424B3")))
+
+# The negation rule, directly. One asserted mention is enough to keep the
+# tier, so a summary that denies one thing and asserts another is unaffected.
+check("'not a preferred stock' is not evidence of a preferred stock",
+      not dispatch._has_retail_security(
+          "linked to an index, not a retail-denominated preferred stock, baby "
+          "bond, or exchange-traded debt"))
+check("an asserted preferred still counts",
+      dispatch._has_retail_security("offering depositary shares of preferred stock"))
+check("a denial followed by an assertion still counts",
+      dispatch._has_retail_security(
+          "These are not common stock; they are $25 par baby bonds."))
+check("SAX's prose '$25 par' is still unaffected",
+      dispatch._is_tradeable_new_issue(
+          '\U0001F4E2 **SAX | 424B2** — offering $SAX notes due 2031 at $25 par\n'
+          '## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "SAX"')[0])
+
+# A real change-of-control trigger event must survive — "trigger event" is
+# deliberately not a scrub pattern on its own.
+check("a real change-of-control trigger event is not scrubbed",
+      "trigger event" in dispatch.render_body(
+          "\U0001F4E2 **ABC | 8-K | 2026-09-10** \u2014 change of control\n"
+          "A change of control trigger event occurred on September 1.", 1900))
+
+
+# ---------------------------------------------------------------------------
 print()
 if failures:
     print(f"{len(failures)} FAILED: {', '.join(failures)}")

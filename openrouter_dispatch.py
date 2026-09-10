@@ -729,6 +729,53 @@ _RETAIL_SECURITY = re.compile(
 )
 
 
+# ⚠ ...and the match has to be an assertion, not a denial. "The filing
+# describes a structured product linked to an index, NOT a retail-denominated
+# preferred stock, baby bond, or exchange-traded debt" contains three
+# _RETAIL_SECURITY matches and says the opposite of what they imply. Six
+# JPMorgan 424B3s cleared this gate on that sentence in Sep 2026.
+#
+# Same shape as SHELF_HEDGES in prefilter, and the same precedence: ONE
+# un-negated match is enough to keep the filing urgent, so a summary that
+# denies one thing and asserts another ("not common stock; $25 par preferred")
+# is unaffected. Only a summary where EVERY mention is a denial loses the
+# tier — and a summary whose sole mention of the reader's universe is a denial
+# is not describing a security he can trade.
+#
+# The window is 60 characters because these denials are lists: in the
+# sentence above "not" sits 24 characters ahead of "preferred stock" and 42
+# ahead of "baby bond". Commas are therefore NOT clause boundaries here — the
+# list is the thing being denied.
+#
+# A stronger stop is, though. "These are not common stock; they are $25 par
+# baby bonds" puts a negation 27 characters ahead of a perfectly good
+# assertion, and a raw window reads it as a denial and demotes a real baby
+# bond. So the lead-in is cut at the last clause boundary, the same way
+# triage._sentence_around() stops a match from borrowing the neighbouring
+# sentence's wording. Over-cutting only shortens the window, which is the
+# safe direction: it can leave a denial unrecognised (a stray ping) but never
+# turn an assertion into one (a missed page).
+_NEGATION_RE = re.compile(
+    r"\bnot\b|n't\b|\bneither\b|\bnor\b|\brather than\b"
+    r"|\binstead of\b|\bother than\b",
+    re.I,
+)
+_CLAUSE_BREAK_RE = re.compile(r"[;:.!?]|\bbut\b|\bhowever\b|\n", re.I)
+_NEGATION_WINDOW = 60
+
+
+def _has_retail_security(summary: str) -> bool:
+    """True if the summary ASSERTS a retail income security at least once."""
+    for m in _RETAIL_SECURITY.finditer(summary):
+        lead = summary[max(0, m.start() - _NEGATION_WINDOW):m.start()]
+        breaks = list(_CLAUSE_BREAK_RE.finditer(lead))
+        if breaks:
+            lead = lead[breaks[-1].end():]
+        if not _NEGATION_RE.search(lead):
+            return True
+    return False
+
+
 def _is_tradeable_new_issue(summary: str) -> tuple[bool, str]:
     """Tier-2 gate. Returns (keep_urgent, reason_if_demoted)."""
     if _LISTING_UNLISTED.search(summary):
@@ -737,7 +784,7 @@ def _is_tradeable_new_issue(summary: str) -> tuple[bool, str]:
         return False, "$1,000 par — institutional, not exchange-traded retail"
     if _PRODUCT_COMMON.search(summary):
         return False, "common stock, not an income security"
-    if not _RETAIL_SECURITY.search(summary):
+    if not _has_retail_security(summary):
         return False, "no preferred / depositary / baby-bond / $25-par signal"
     return True, ""
 
@@ -927,7 +974,7 @@ def fit_to_budget(body: str, budget: int) -> str:
 # a different conclusion.
 _META_LINE_RE = re.compile(
     r"^\s*(\(?Note:|Re-evaluating|Per strict interpretation|However, as\b"
-    r"|Omit(ting)? (the )?highlight|No highlight block|-{3,}\s*$)",
+    r"|Omit(ting)? (the )?highlight|No highlight(ed)? |-{3,}\s*$)",
     re.I,
 )
 
@@ -937,8 +984,35 @@ _META_LINE_RE = re.compile(
 # to -4 trigger is literally stated." in the middle of a paragraph, where a
 # line-anchored rule cannot reach it. Scrubbed sentence by sentence so the
 # surrounding analysis survives.
+#
+# Sep 2026 additions, from six JPMorgan 424B3 posts whose entire body was the
+# model justifying a decision it was told to make silently:
+#
+#   "No highlighted trigger event (priority 1-4) is literally stated in the
+#    filing. ... The filing describes a structured product linked to an
+#    index, not a retail-denominated preferred stock, baby bond, or
+#    exchange-traded debt. ... does not relate to a newly listed or modified
+#    security in the reader's universe."
+#
+# Every clause of that is SYSTEM_PROMPT vocabulary read back. The old
+# patterns missed all of it by inches: the model wrote "highlighted trigger
+# event", not "highlight block", and its "priority 1-4" used an EN DASH,
+# which `(to|through|-)` does not match. Hence the dash class below.
+#
+# This is not only a readability fix. That second sentence recites the
+# reader's tradeable universe in order to deny it, and "preferred stock, baby
+# bond, or exchange-traded debt" is exactly what _RETAIL_SECURITY looks for —
+# so the model explaining that a filing is NOT a preferred stock was scoring
+# as evidence that it IS one, and clearing the tier-2 gate on the strength of
+# a negation. See _has_retail_security().
+#
+# "trigger event" is deliberately NOT a pattern on its own: a change-of-
+# control trigger event is a real thing a real filing discloses.
 _PROMPT_ECHO_RE = re.compile(
-    r"highlight block|priority[- ][1-7]\s*(to|through|-)"
+    r"highlight(ed)?\s+(block|trigger)"
+    r"|priority[\s-]*[1-7]\s*(to|through|[-\u2010-\u2015])"
+    r"|literally stated"
+    r"|reader.{0,3}s\s+(tradeable\s+|tradable\s+)?universe"
     r"|per (the )?(guidance|template|instructions)|output template",
     re.I,
 )
