@@ -45,7 +45,12 @@ FETCH_FAIL_FILE = BASE_DIR / "fetch_failures.json"
 INBOX_DIR      = BASE_DIR / "filings-inbox"
 LOG_FILE       = BASE_DIR / "edgar_poller.log"
 
-MAX_SEEN = 10_000   # cap memory of seen accessions
+# Accessions remembered. The OLDEST are forgotten first (see load_seen()), so
+# the cap only has to outlast the feed: while a filing can still be reached by
+# a read, everything recorded after it is either newer than it or older but
+# still reachable — at most one deepest read (CATCHUP_PAGES pages) of each.
+# test_pipeline.py holds MAX_SEEN above twice that.
+MAX_SEEN = 10_000
 
 # EDGAR's current-filings feed caps `count` at 100 ENTRIES per page — asking
 # for 200 or 400 silently returns 100 — but `start` pages backwards without
@@ -138,18 +143,31 @@ def edgar_is_open() -> bool:
 # Persistence helpers
 # ---------------------------------------------------------------------------
 
-def load_seen() -> set[str]:
+def load_seen() -> dict[str, None]:
+    """Seen accessions, oldest first — a dict used as an insertion-ordered set.
+
+    The order is what the MAX_SEEN cap trims by, and it has to be age. Until
+    2026-09-29 the cap kept `sorted(seen)[-MAX_SEEN:]`, the highest accession
+    NUMBERS. An accession is `<filer CIK>-<yy>-<sequence>`, so that sort is by
+    who filed, not when: once the store was full, a filing submitted under a
+    low CIK — AUB's 8-K, 0000883948-26-000075 — sorted below every entry kept,
+    was trimmed the moment it was added, and was queued again on every poll.
+
+    A file written by the old code is a sorted list. It loads as-is and its
+    entries simply age out first.
+    """
     if SEEN_FILE.exists():
         try:
-            return set(json.loads(SEEN_FILE.read_text()))
+            return dict.fromkeys(json.loads(SEEN_FILE.read_text()))
         except Exception as e:
             log.warning(f"Could not load seen_accessions.json: {e}")
-    return set()
+    return {}
 
 
-def save_seen(seen: set[str]) -> None:
+def save_seen(seen: dict[str, None]) -> None:
     try:
-        SEEN_FILE.write_text(json.dumps(sorted(seen)))
+        # Never sorted: the order is the age. See load_seen().
+        SEEN_FILE.write_text(json.dumps(list(seen)))
     except Exception as e:
         log.warning(f"Could not save seen_accessions.json: {e}")
 
@@ -533,12 +551,12 @@ def write_filing_payload(
 # ---------------------------------------------------------------------------
 
 def poll_once(
-    seen: set[str],
+    seen: dict[str, None],
     watchlist: dict[str, str],
     max_pages: int = 1,
     since: datetime.datetime | None = None,
     max_queue: int | None = None,
-) -> tuple[set[str], int]:
+) -> tuple[dict[str, None], int]:
     """
     Run one poll cycle.
     Returns (updated_seen, number_of_new_filings_queued).
@@ -582,13 +600,13 @@ def poll_once(
             continue
 
         if watchlist and cik not in watchlist:
-            seen.add(accession)   # mark as seen so we don't re-check next cycle
+            seen[accession] = None   # mark as seen so we don't re-check next cycle
             continue
 
         ticker = watchlist.get(cik, "UNKNOWN")
 
         if max_queue is not None and queued >= max_queue:
-            seen.add(accession)
+            seen[accession] = None
             over_cap.append(f"{ticker} {hit['form_type']} {accession}")
             continue
 
@@ -608,7 +626,7 @@ def poll_once(
                     f"(attempt {attempts}/{MAX_FETCH_ATTEMPTS}) — retrying next cycle"
                 )
             else:
-                seen.add(accession)
+                seen[accession] = None
                 failures.pop(accession, None)
                 url = (f"https://www.sec.gov/Archives/edgar/data/{cik}/"
                        f"{accession.replace('-', '')}/{accession}-index.htm")
@@ -626,7 +644,7 @@ def poll_once(
             save_fetch_failures(failures)
             continue
 
-        seen.add(accession)
+        seen[accession] = None
         if failures.pop(accession, None):
             save_fetch_failures(failures)
 
@@ -635,9 +653,6 @@ def poll_once(
 
         # Respect SEC rate guidance: max 10 req/sec, we stay well below.
         time.sleep(0.5)
-
-        if len(seen) > MAX_SEEN:
-            seen = set(list(sorted(seen))[-MAX_SEEN:])
 
         save_seen(seen)
 
@@ -654,6 +669,9 @@ def poll_once(
             log.warning(f"    not dispatched: {item}")
         log.warning("Raise --max-queue if this was not a cold start.")
 
+    if len(seen) > MAX_SEEN:
+        # Forget the OLDEST, never the lowest-numbered — see load_seen().
+        seen = dict.fromkeys(list(seen)[-MAX_SEEN:])
     save_seen(seen)
     return seen, queued
 
