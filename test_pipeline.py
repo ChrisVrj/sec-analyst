@@ -15,8 +15,11 @@ week of squinting at #sec-filings.
 """
 
 import datetime
+import json
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 os.environ.setdefault("NVIDIA_API_KEY", "test")
 os.environ.setdefault("DISCORD_WEBHOOK", "https://example.invalid/webhook")
@@ -557,7 +560,8 @@ SABA_FORM4 = [
 ]
 
 
-def _run_poll(entries, seen=None, fetch_text="Saba Capital acquired shares."):
+def _run_poll(entries, seen=None, fetch_text="Saba Capital acquired shares.",
+              watchlist=WATCHLIST):
     """poll_once against a stubbed feed and a stubbed document fetch."""
     queued_hits = []
     real = (edgar_poller.fetch_recent_filings,
@@ -577,7 +581,7 @@ def _run_poll(entries, seen=None, fetch_text="Saba Capital acquired shares."):
     edgar_poller.save_fetch_failures = lambda f: store.update(f)
     edgar_poller.notify_failure = lambda m: notices.append(m)
     try:
-        out_seen, n = edgar_poller.poll_once(seen if seen is not None else set(), WATCHLIST)
+        out_seen, n = edgar_poller.poll_once(seen if seen is not None else {}, watchlist)
     finally:
         (edgar_poller.fetch_recent_filings, edgar_poller.fetch_filing_documents,
          edgar_poller.write_filing_payload, edgar_poller.save_seen,
@@ -618,6 +622,112 @@ check("…and no premature alert", notices == [])
 check("the retry budget is bounded",
       edgar_poller.MAX_FETCH_ATTEMPTS > 1 and edgar_poller.MAX_FETCH_ATTEMPTS <= 10,
       f"MAX_FETCH_ATTEMPTS={edgar_poller.MAX_FETCH_ATTEMPTS}")
+
+
+# ---------------------------------------------------------------------------
+# The dedupe stores forgot the newest filing, not the oldest — 2026-09-29.
+#
+# #sec-filings received AUB's Q3 earnings-date 8-K (0000883948-26-000075) on
+# every poll, reworded by the model each time. seen_accessions.json and
+# dispatched_accessions.json were both capped by keeping
+# sorted(...)[-10_000:], the highest accession NUMBERS. An accession is
+# <filer CIK>-<yy>-<sequence>, so that sort is by filer, not by time. Once a
+# store was full, anything filed under a low CIK sorted below every entry
+# kept and was trimmed the moment it was added: the poller queued it again on
+# every poll, and the dispatcher — whose store had just reached its own cap —
+# posted it again. The incident log read "Loaded 10000 previously dispatched
+# accessions" on every run, never 10001.
+# ---------------------------------------------------------------------------
+print("\nseen / dispatched stores")
+
+AUB_8K = [_fake_entry("0000883948-26-000075", "883948", "8-K",
+                      "2026-09-29T07:15:00-04:00", "Filer")]
+AUB_ACC = AUB_8K[0]["accession"]
+
+
+def _full_store(size: int) -> dict:
+    """A store at its cap whose every entry sorts ABOVE AUB — the state the
+    live stores had drifted into. Seeded highest number first, so the oldest
+    entry is the highest-numbered one and "forget the oldest" and "forget the
+    lowest" pick different victims."""
+    return dict.fromkeys(f"0001918704-26-{i:06d}" for i in reversed(range(size)))
+
+
+full = _full_store(edgar_poller.MAX_SEEN)
+oldest, lowest = next(iter(full)), min(full)
+_, seen_after, n, _, _ = _run_poll(AUB_8K, seen=full, watchlist={"883948": "AUB"})
+check("a low-CIK filing reaching a full seen store is queued once", n == 1, f"got {n}")
+check("…and is still remembered afterwards", AUB_ACC in seen_after,
+      "a sorted trim drops it straight back out")
+check("…with the store held at its cap", len(seen_after) == edgar_poller.MAX_SEEN,
+      f"got {len(seen_after)}")
+check("…by forgetting the oldest entry, not the lowest-numbered",
+      oldest not in seen_after and lowest in seen_after)
+_, _, n, _, _ = _run_poll(AUB_8K, seen=seen_after, watchlist={"883948": "AUB"})
+check("the next poll does not queue it again", n == 0, f"got {n}")
+
+# FIFO eviction is only safe if nothing still reachable in the feed can age
+# out. While a filing is reachable, everything recorded after it is either
+# newer than it or older but still reachable — at most one deepest read each.
+check("the seen store outlasts two of the deepest feed reads",
+      edgar_poller.MAX_SEEN
+      > 2 * edgar_poller.CATCHUP_PAGES * edgar_poller.FEED_PAGE_SIZE,
+      f"MAX_SEEN={edgar_poller.MAX_SEEN}, CATCHUP_PAGES={edgar_poller.CATCHUP_PAGES}")
+
+
+# The dispatcher's store is the last guard against a double post. Run its
+# real main() twice over the same AUB payload, as the poller handed it over
+# on consecutive polls.
+def _dispatch_twice() -> tuple[list, int]:
+    posted: list[str] = []
+
+    def fake_dispatch(fp):
+        posted.append(fp.stem)
+        fp.unlink()
+        return 0
+
+    real = (dispatch.INBOX_DIR, dispatch.PROCESSED, dispatch.DISPATCHED_FILE,
+            dispatch.dispatch)
+    with tempfile.TemporaryDirectory() as tmp:
+        inbox = Path(tmp) / "filings-inbox"
+        (inbox / "processed").mkdir(parents=True)
+        store = Path(tmp) / "dispatched_accessions.json"
+        store.write_text(json.dumps(list(_full_store(dispatch.MAX_DISPATCHED))))
+        dispatch.INBOX_DIR, dispatch.PROCESSED = inbox, inbox / "processed"
+        dispatch.DISPATCHED_FILE, dispatch.dispatch = store, fake_dispatch
+        try:
+            for _ in range(2):
+                (inbox / f"{AUB_ACC}.json").write_text(json.dumps({"accession": AUB_ACC}))
+                dispatch.main()
+            kept = len(json.loads(store.read_text()))
+        finally:
+            (dispatch.INBOX_DIR, dispatch.PROCESSED, dispatch.DISPATCHED_FILE,
+             dispatch.dispatch) = real
+    return posted, kept
+
+
+posted, kept = _dispatch_twice()
+check("a full dispatched store posts a low-CIK filing exactly once",
+      posted == [AUB_ACC], f"dispatched {len(posted)}x")
+check("…and still holds its cap", kept == dispatch.MAX_DISPATCHED, f"got {kept}")
+
+# The order also has to survive the round trip through the Actions cache: a
+# sorted write undoes all of the above between two processes, one run later.
+for store_name, module, attr, save, load in (
+        ("seen", edgar_poller, "SEEN_FILE",
+         edgar_poller.save_seen, edgar_poller.load_seen),
+        ("dispatched", dispatch, "DISPATCHED_FILE",
+         dispatch.save_dispatched, dispatch.load_dispatched)):
+    with tempfile.TemporaryDirectory() as tmp:
+        real_path = getattr(module, attr)
+        setattr(module, attr, Path(tmp) / "store.json")
+        try:
+            save(dict.fromkeys(["0009999999-26-000001", AUB_ACC]))
+            reloaded = list(load())
+        finally:
+            setattr(module, attr, real_path)
+    check(f"the {store_name} store is saved in insertion order, not sorted",
+          reloaded == ["0009999999-26-000001", AUB_ACC], f"got {reloaded}")
 
 
 # ---------------------------------------------------------------------------

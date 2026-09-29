@@ -159,6 +159,7 @@ INBOX_DIR       = BASE_DIR / "filings-inbox"
 PROCESSED       = INBOX_DIR / "processed"
 LOG_FILE        = BASE_DIR / "dispatch.log"
 DISPATCHED_FILE = BASE_DIR / "dispatched_accessions.json"
+MAX_DISPATCHED  = 10_000   # oldest forgotten first — see load_dispatched()
 
 MAX_TOKENS          = 900
 MAX_TEXT_CHARS      = 400_000
@@ -394,18 +395,26 @@ log.info(f"DISCORD_WEBHOOK len={len(DISCORD_WEBHOOK)} prefix={DISCORD_WEBHOOK[:5
 # Persistence
 # ---------------------------------------------------------------------------
 
-def load_dispatched() -> set[str]:
+def load_dispatched() -> dict[str, None]:
+    """Accessions already handled, oldest first — ordered, never sorted.
+
+    Same reason as edgar_poller.load_seen(): the MAX_DISPATCHED cap has to
+    forget the OLDEST. It used to keep the highest accession numbers, which
+    sorts by filer CIK rather than by time, so once this store filled up it
+    forgot AUB's 8-K (0000883948-26-000075) the moment it was posted, and
+    posted it again every time the poller handed it over.
+    """
     if DISPATCHED_FILE.exists():
         try:
-            return set(json.loads(DISPATCHED_FILE.read_text()))
+            return dict.fromkeys(json.loads(DISPATCHED_FILE.read_text()))
         except Exception as e:
             log.warning(f"Could not load dispatched_accessions.json: {e}")
-    return set()
+    return {}
 
 
-def save_dispatched(dispatched: set[str]) -> None:
+def save_dispatched(dispatched: dict[str, None]) -> None:
     try:
-        DISPATCHED_FILE.write_text(json.dumps(sorted(dispatched)))
+        DISPATCHED_FILE.write_text(json.dumps(list(dispatched)))
     except Exception as e:
         log.warning(f"Could not save dispatched_accessions.json: {e}")
 
@@ -1315,7 +1324,7 @@ def main() -> None:
             continue
 
         sleep_for = dispatch(fp)
-        dispatched.add(raw_acc)
+        dispatched[raw_acc] = None
         changed = True
 
         if sleep_for:
@@ -1325,8 +1334,8 @@ def main() -> None:
             skipped_count += 1
 
     if changed:
-        if len(dispatched) > 10_000:
-            dispatched = set(sorted(dispatched)[-10_000:])
+        if len(dispatched) > MAX_DISPATCHED:
+            dispatched = dict.fromkeys(list(dispatched)[-MAX_DISPATCHED:])
         save_dispatched(dispatched)
 
     log.info(

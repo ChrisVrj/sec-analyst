@@ -58,6 +58,15 @@ asks for it. Such a filing used to be marked seen and never looked at again.
 It is now retried for `MAX_FETCH_ATTEMPTS` cycles, and giving up posts a ❌ to
 Discord with the EDGAR link instead of a line in a log nobody opens.
 
+**The dedupe stores forget the oldest filing first.** `seen_accessions.json`
+and `dispatched_accessions.json` hold 10,000 accessions each, and until
+2026-09-29 the cap kept the highest accession *numbers*. An accession is
+`<filer CIK>-<yy>-<sequence>`, so that order is by who filed, not when: once a
+store was full, anything submitted under a low CIK was dropped the moment it
+was recorded, and AUB's 8-K reached `#sec-filings` on every poll. Both files
+are now kept in the order accessions were recorded. **Never sort them** — the
+order is the age.
+
 The LLM is **NVIDIA Nemotron 3** via NVIDIA NIM (free, ~40 req/min, no daily
 cap), with **OpenRouter free models as an automatic fallback**.
 
