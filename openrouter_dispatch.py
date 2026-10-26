@@ -53,7 +53,7 @@ import urllib.error
 from datetime import datetime, UTC
 from pathlib import Path
 
-from prefilter import should_skip
+from prefilter import RETAIL_FRACTION_RE, plain_text, retail_amount, should_skip
 from triage import triage_filing
 
 # ---------------------------------------------------------------------------
@@ -717,9 +717,30 @@ _TRADEABLE_GATED_KEYWORDS: frozenset[str] = frozenset({"LISTING:"})
 _FIELD = r"\*\*{}:\*\*[^\n]*"
 _PRODUCT_COMMON = re.compile(_FIELD.format("Product") + r"common\s+(stock|share)", re.I)
 _LISTING_UNLISTED = re.compile(_FIELD.format("Listing") + r"unlisted", re.I)
-# $1,000 / $1000 par is the institutional denomination. Retail income
-# securities price at $25 (occasionally $10/$20/$50).
-_PAR_INSTITUTIONAL = re.compile(r"\*\*Par:\*\*\s*\$?\s*1[,.]?000", re.I)
+
+# Par. Retail income securities price at $25 (occasionally $10/$20/$50);
+# $1,000 is the institutional denomination.
+#
+# Oct 2026: two more shapes pinged. Strive's SATS preferred is Nasdaq-listed
+# at a $100 stated amount ("**Par:** $100.00 (stated amount)"); Citi's euro
+# notes wrote "**Par:** €100,000 (minimum) + €1,000 increments". The old
+# pattern looked for "$1,000" at the start of the field and nothing else —
+# which also meant a correct "$1,000 per share (equivalent to $25 per
+# depositary share)" would have been demoted. So the whole field is read:
+# any retail amount keeps it, otherwise a foreign currency or $100-and-up
+# rules it out.
+_PAR_LINE = re.compile(r"\*\*Par:\*\*([^\n]*)", re.I)
+_PAR_AMOUNT = re.compile(
+    r"(€|£|¥|C\$|A\$|CHF|EUR|GBP|JPY|CAD|AUD|US\$|\$)\s?(\d[\d,]*(?:\.\d+)?)", re.I)
+_RETAIL_PAR = {10.0, 20.0, 25.0, 50.0}
+
+# Listing. The highlight block is for NYSE / NASDAQ — Citi's euro notes
+# arrived as "## 📢 LISTING: PUBLIC — LUXEMBOURG STOCK EXCHANGE SYMBOL "n/d"".
+_NON_US_EXCHANGE = re.compile(
+    r"luxembourg|london\s+stock|euronext|irish|dublin|frankfurt|\btsx\b|toronto"
+    r"|six\s+swiss|singapore|hong\s+kong|tokyo|australian|\basx\b|official\s+list",
+    re.I)
+_US_EXCHANGE = re.compile(r"\bnyse\b|nasdaq|new\s+york\s+stock", re.I)
 # Positive evidence that the thing being offered is actually in his universe.
 #
 # ⚠ The par clause must match prose as well as the **Par:** field. Aug 2026:
@@ -785,16 +806,62 @@ def _has_retail_security(summary: str) -> bool:
     return False
 
 
-def _is_tradeable_new_issue(summary: str) -> tuple[bool, str]:
-    """Tier-2 gate. Returns (keep_urgent, reason_if_demoted)."""
+def _par_outside_universe(summary: str) -> str:
+    """Why the **Par:** field rules the security out, or '' if it doesn't."""
+    m = _PAR_LINE.search(summary)
+    if not m:
+        return ""
+    amounts = [(ccy.upper(), float(num.replace(",", "")))
+               for ccy, num in _PAR_AMOUNT.findall(m.group(1))]
+    if any(ccy in ("$", "US$") and amt in _RETAIL_PAR for ccy, amt in amounts):
+        return ""
+    foreign = next((ccy for ccy, _ in amounts if ccy not in ("$", "US$")), None)
+    if foreign:
+        return f"par in {foreign} — not a USD security"
+    top = max((amt for _, amt in amounts), default=0.0)
+    # "$25,000 per share" over a 1/1,000th depositary share is $25 paper.
+    if top >= 100 and not RETAIL_FRACTION_RE.search(summary):
+        return f"${top:,.2f} par — not a $25-par retail security"
+    return ""
+
+
+def _listed_outside_us(summary: str) -> bool:
+    """True if the LISTING header or **Listing:** field names only a
+    non-US exchange."""
+    lines = " ".join(
+        l for l in summary.splitlines()
+        if (l.lstrip().startswith("#") and "LISTING" in l.upper())
+        or re.match(r"\s*\*\*Listing:\*\*", l, re.I))
+    return bool(_NON_US_EXCHANGE.search(lines)) and not _US_EXCHANGE.search(lines)
+
+
+def _is_tradeable_new_issue(summary: str,
+                            filing_text: str | None = None) -> tuple[bool, str]:
+    """Tier-2 gate. Returns (keep_urgent, reason_if_demoted).
+
+    `filing_text`, when given, has to back the summary's retail claim with a
+    retail amount of its own — see the BofA Series WW note below.
+    """
     if _LISTING_UNLISTED.search(summary):
         return False, "listing states UNLISTED"
-    if _PAR_INSTITUTIONAL.search(summary):
-        return False, "$1,000 par — institutional, not exchange-traded retail"
+    par = _par_outside_universe(summary)
+    if par:
+        return False, par
+    if _listed_outside_us(summary):
+        return False, "listed outside the US"
     if _PRODUCT_COMMON.search(summary):
         return False, "common stock, not an income security"
     if not _has_retail_security(summary):
         return False, "no preferred / depositary / baby-bond / $25-par signal"
+    # Oct 2026: BofA's 8-K for its Series WW preferred (0001193125-26-430566)
+    # pinged as "2M depositary shares ... ($25 par)". The filing says
+    # "liquidation preference of $25,000 per share"; each depositary share is
+    # 1/25th of it, $1,000, unlisted — the prospectus says so, and prefilter
+    # dropped it. The model read $25,000 as $25. A summary can only claim a
+    # retail size the filing states somewhere; a fraction is not enough here,
+    # because every BofA 8-K's cover lists its listed 1/1,000th series.
+    if filing_text is not None and not retail_amount(plain_text(filing_text)):
+        return False, "the filing never states a retail amount"
     return True, ""
 
 
@@ -844,7 +911,8 @@ def _is_calendar_form(form_type: str) -> bool:
     return form in _CALENDAR_FORMS
 
 
-def classify_priority(summary: str, form_type: str = "") -> tuple[int, str]:
+def classify_priority(summary: str, form_type: str = "",
+                      filing_text: str | None = None) -> tuple[int, str]:
     """Returns (tier, label); tier 0 means routine.
 
     Two independent signals, both anchored so prose can't trigger them:
@@ -860,7 +928,8 @@ def classify_priority(summary: str, form_type: str = "") -> tuple[int, str]:
     disarms the emoji signal on calendar-driven forms. It defaults to "" —
     unknown forms stay permissive.
 
-    Tier 2 additionally has to clear _is_tradeable_new_issue(). Tiers 1, 3 and
+    Tier 2 additionally has to clear _is_tradeable_new_issue(), which also
+    checks `filing_text` (the EDGAR payload) when it is given. Tiers 1, 3 and
     4 are NOT gated: a redemption or tender on something he holds is the whole
     point of the channel, and a false negative there costs far more than a
     false positive.
@@ -885,12 +954,12 @@ def classify_priority(summary: str, form_type: str = "") -> tuple[int, str]:
             continue
         if header_hit and any(k in headers for k in keywords
                               if k in _TRADEABLE_GATED_KEYWORDS):
-            keep, why = _is_tradeable_new_issue(summary)
+            keep, why = _is_tradeable_new_issue(summary, filing_text)
             if not keep:
                 log.info(f"Demoting new issuance to routine: {why}")
                 continue
         elif not header_hit and tier == 2 and label == "public listing":
-            keep, why = _is_tradeable_new_issue(summary)
+            keep, why = _is_tradeable_new_issue(summary, filing_text)
             if not keep:
                 log.info(f"Demoting new issuance to routine: {why}")
                 continue
@@ -1223,7 +1292,8 @@ def dispatch(filing_path: Path) -> int:
         move_to_processed(filing_path, prefix="err_")
         return provider["sleep"]
 
-    tier, priority_label = classify_priority(body, form_type)
+    tier, priority_label = classify_priority(
+        body, form_type, filing.get("filing_text", ""))
 
     # The filing gets a vote of its own. classify_priority reads the model's
     # wording, which is fine until the model describes the event correctly and

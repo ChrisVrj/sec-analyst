@@ -25,6 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from html import unescape as unescape_entities
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -379,11 +380,13 @@ def strip_html(html: str, max_chars: int = 300_000) -> str:
     text = re.sub(r"<script.*?>.*?</script>", " ", html, flags=re.I | re.S)
     text = re.sub(r"<style.*?>.*?</style>",   " ", text, flags=re.I | re.S)
     text = re.sub(r"<[^>]+>", " ", text)
-    text = (text
-            .replace("&nbsp;", " ")
-            .replace("&amp;",  "&")
-            .replace("&lt;",   "<")
-            .replace("&gt;",   ">"))
+    # Every entity, not just &nbsp; &amp; &lt; &gt;. EDGAR filers encode
+    # punctuation and symbols freely — "Denominations&#58; $2,000", euro
+    # amounts as "&#128;100,000", quotes as "&ldquo;" — and the four-entity
+    # version passed the rest through, where prefilter could not match across
+    # them and the model quoted them into Discord verbatim. Decoded after the
+    # tags are gone, so a decoded "<" can never be read as markup.
+    text = unescape_entities(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_chars]
 
