@@ -276,6 +276,13 @@ statements still page on form type. The other
 direction got fixed too: a $25 term sheet that says `Offering Price` rather
 than "public offering" used to page from nothing; it now pages on its size.
 
+**A post that says `Listing: UNLISTED` never pings as a new issue.** Goldman's
+MOBU index supplement pinged on 2026-10-22 with that line in plain sight,
+because triage promoted every 424B2 past the body. Whatever triage says, a
+tier-2 promotion now stands down when the post it rides on says UNLISTED
+(rights offerings and redemptions excepted) — the reader's own evidence
+outranks the form type.
+
 **An offering that says it will never trade is not urgent, on any form.** The
 filing-side guard scored every `424B*` a tier 2 on form type and can only
 promote, so the tradeable gate above had been dead on 424B filings for as long
@@ -333,6 +340,7 @@ most, and both are tuned against real filings:
 | Structured notes (autocallable, buffer, participation rate, underlier) | payoff vocabulary |
 | Explicitly unlisted offerings | "will not be listed…", and the term-sheet field `Listing: None` |
 | $1,000-and-up paper | a stated `Denominations: $2,000 x $1,000` field, `minimum denominations of $2,000`, or `$1,000 per depositary share`, with no retail amount (`$25 per depositary share`, `denominations of $25`) or retail fraction (`1/1,000th`) anywhere |
+| Amendments (`/A`) | the form type — except tender-offer amendments (price bumps, extensions, final proration) and a tracked activist's `SCHEDULE 13D/A` |
 | Non-USD paper | a denomination or principal amount in another currency — `denominations of €100,000`, `Aggregate Principal Amount: C$750,000,000` |
 
 All of it is matched on decoded text. Until Oct 2026 the poller decoded four

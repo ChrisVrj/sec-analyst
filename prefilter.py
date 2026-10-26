@@ -136,6 +136,10 @@ UNLISTED_SIGNALS: list[str] = [
     "listing: not applicable",
     "listing: n/a",
     "exchange listing: none",
+    # Goldman's notes: "your notes will not be listed or displayed on any
+    # securities exchange" (0001193125-26-427988, posted as "Listing:
+    # UNLISTED" and pinged anyway on 2026-10-22).
+    "will not be listed or displayed on any",
 ]
 
 # The same statement with its negation ahead of the subject, which no fixed
@@ -588,6 +592,27 @@ OWNERSHIP_FORMS: set[str] = {"3", "4", "5", "3/A", "4/A", "5/A"}
 # name is in the body of the 144 even when the matched role is the issuer.
 PROPOSED_SALE_FORMS: set[str] = {"144", "144/A"}
 
+# ---------------------------------------------------------------------------
+# Amendments — Oct 2026: "/A" filings restate something already filed, and
+# Chris asked for them gone. In the week to 2026-10-23, 41 reached the model:
+# 26 SCHEDULE 13G/A passive-holder updates (BNY Mellon alone filed nine in
+# half an hour), 40-APP/A exemptive applications, EARN's N-2/A shelf
+# amendment and ASA's N-14 8C/A — those two pinged #sec-urgent. Nothing in
+# any of them was new.
+#
+# Two kinds stay, because their amendments ARE the news:
+#   · tender offers — an amended Schedule TO / 14D-9 carries the price bump,
+#     the extension or the final proration of an offer that is still live
+#     (triage.TENDER_FORMS pages them for the same reason)
+#   · SCHEDULE 13D/A from a tracked activist — Saba's stake changes arrive
+#     only as 13D amendments, which is the surveillance §1 exists for
+# Form 3/4/5/A and 144/A keep their own activist gate above.
+AMENDMENT_EXCEPTIONS: set[str] = {
+    "SC TO-I", "SC TO-T", "SC TO-C", "SC 14D9", "SC 13E3", "SC 13E1",
+}
+ACTIVIST_AMENDMENTS: set[str] = {"SC 13D", "SCHEDULE 13D"}
+
+
 OFFERING_FORMS: set[str] = {
     "424B1", "424B2", "424B3", "424B4", "424B5", "424B7", "424B8", "FWP",
 }
@@ -921,6 +946,17 @@ def should_skip(filing: dict) -> tuple[bool, str]:
                           f"from a tracked activist — the executed sale "
                           f"arrives on a Form 4")
         return False, ""
+
+    # 2b) Amendments — old news, unless the amendment is the news. See
+    #     AMENDMENT_EXCEPTIONS.
+    if form_type.endswith("/A"):
+        base = form_type[:-2].strip()
+        if base in AMENDMENT_EXCEPTIONS:
+            pass
+        elif base in ACTIVIST_AMENDMENTS and is_activist_filer(filing):
+            pass
+        else:
+            return True, f"{form_type} amends an earlier filing — old news"
 
     # 3) 424B / FWP — skip unlisted structured products and unlisted senior notes
     if form_type in OFFERING_FORMS:

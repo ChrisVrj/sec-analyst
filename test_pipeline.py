@@ -2169,6 +2169,67 @@ check("…and the treatment has to be near the front of the filing",
 
 
 # ---------------------------------------------------------------------------
+# Oct 2026 — amendments are old news, and a post that says UNLISTED does not
+# ping. Chris: "most of the '/A' filings indicate amendments to already
+# existing filings ... we should drop them", and "if the LLM is listing this
+# issue as 'Listing: UNLISTED' in caps lock why am I pinged in sec-urgent?"
+# ---------------------------------------------------------------------------
+print("\nOct 2026 — amendments, and a visible UNLISTED")
+
+SABA_13DA = ("SCHEDULE 13D/A Amendment No. 7 Saba Capital Management, L.P. "
+             "sold 324,000 common shares of the Fund.")
+for form, text, want, why in [
+    ("SCHEDULE 13G/A", "BNY Mellon updates its subsidiary list.", True, "passive holder update"),
+    ("N-2/A", "Amendment to shelf registration statement; rights offering.", True, "shelf amendment"),
+    ("N-14 8C/A", "BDC conversion; merger proposed.", True, "merger registration amendment"),
+    ("40-APP/A", "Amended application for co-investment relief.", True, "exemptive application"),
+    ("8-K/A", "Amended to include financial statements.", True, "8-K amendment"),
+    ("SCHEDULE 13D/A", "Herzfeld group amends its 13D after the tender.", True, "13D/A, not an activist"),
+    ("SCHEDULE 13D/A", SABA_13DA, False, "13D/A from a tracked activist"),
+    ("SC 13D/A", SABA_13DA, False, "old-style form name"),
+    ("SC TO-I/A", "Final results: 7.33M shares tendered, 26% proration.", False, "tender amendment"),
+    ("4/A", "Saba Capital amended Form 4.", False, "activist Form 4/A, own gate"),
+]:
+    skip, reason = prefilter.should_skip(
+        {"form_type": form, "entity_name": "FUND", "filing_text": text})
+    check(f"{form}: {'dropped' if want else 'kept'} — {why}", skip == want,
+          f"skip={skip} reason={reason!r}")
+
+# Goldman's MOBU index supplement, verbatim as posted. Triage used to score
+# every 424B2 a tier 2 and promote past the body that said UNLISTED.
+GS_MOBU_POST = (
+    "\U0001F4C4 **GS | 424B2 | 2026-10-21** — GS Finance Corp. files index "
+    "supplement for MOBU Focus ER Index-linked structured notes (MTN Series F)"
+    "\n\nCompany: The Goldman Sachs Group, Inc.\n\n"
+    "## \U0001F4E2 NEW ISSUANCE (STRUCTURED NOTES — INSTITUTIONAL)\n"
+    "**Product:** structured note (Medium-Term Notes, Series F)\n"
+    "**Listing:** UNLISTED — \"your notes will not be listed or displayed on "
+    "any securities exchange\"\n**Par:** $1,000 (integral multiples)"
+)
+check("Goldman's own wording now drops the filing before the LLM",
+      prefilter.should_skip({"form_type": "424B2", "entity_name": "GS",
+                             "filing_text": "Your notes will not be listed or "
+                             "displayed on any securities exchange or included "
+                             "in any interdealer market quotation system."})[0])
+_real_triage = dispatch.triage_filing
+try:
+    # Whatever the filing-side vote, a post that says UNLISTED cannot ping as
+    # a new issue.
+    dispatch.triage_filing = lambda *a, **k: (2, "new issuance (form type)", [])
+    check("a post that says Listing: UNLISTED is not promoted to a ping",
+          dispatch.route(GS_MOBU_POST, {"form_type": "424B2", "filing_text": ""})[0] == 0)
+    dispatch.triage_filing = lambda *a, **k: (2, "new issuance (form type)",
+                                              ["rights offering language in the filing"])
+    check("…unless it is a rights offering",
+          dispatch.route(GS_MOBU_POST, {"form_type": "424B2", "filing_text": ""})[0] == 2)
+    dispatch.triage_filing = lambda *a, **k: (1, "redemption (filing text)", [])
+    check("…and a redemption still outranks it",
+          dispatch.route(GS_MOBU_POST, {"form_type": "424B2", "filing_text": ""})[0] == 1)
+finally:
+    dispatch.triage_filing = _real_triage
+
+
+# ---------------------------------------------------------------------------
 print()
 if failures:
     print(f"{len(failures)} FAILED: {', '.join(failures)}")
