@@ -221,9 +221,25 @@ amount (`$1,000` institutional paper even if NYSE-listed, Strive's `$100.00
 baby-bond / $25-par signal at all. The summary's retail claim also has to be
 in the filing: BofA's Series WW 8-K pinged as "($25 par)" when the filing
 says `$25,000 per share` and the depositary shares were $1,000 each, so a
-tier 2 needs the filing itself to state a retail amount somewhere. Redemptions,
-M&A and tender offers are **not** gated — a missed call notice costs more than
-a spare ping.
+tier 2 needs the filing itself to state a retail amount somewhere. Redemptions
+and tender offers are **not** gated — a missed call notice costs more than a
+spare ping.
+
+**An M&A ping has to touch his paper.** The prompt reserves the `## ⚠️ M&A —
+CHANGE OF CONTROL` block for deals affecting preferreds or baby bonds; the
+model writes it for any deal. In the week to 2026-10-23 that was 22 pings —
+BancFirst buying a private bank (its own post said "no public preferreds or
+baby bonds issued by either party"), Prudential selling its Brazilian
+business, a 10-Q noting a pending merger. Tier 3 now stays urgent only when
+the post names the security the deal touches — a preferred, a depositary
+share, a baby bond, a note by its ticker (`6% 2043 notes (JSM)`), or a
+substantive `**Treatment of preferreds:**` field — or when the filing itself
+says what happens to one ("each share of … Preferred Stock … will be
+converted", "Navient LLC will assume the obligations of the listed notes").
+A denied or "unaffected" mention doesn't count. Replayed on that week, 16 of
+the 22 go to `#sec-filings` without a mention; Navient, DigitalBridge, WaFd's
+merger proxy, Valley and Star Equity still ping, and NEWT's note exchange
+pings as the tender it also is.
 
 The one common-share exception is a **CEF or BDC rights offering**, which has
 its own tier-2 rule (🧨) and is deliberately **not** gated: shares outstanding
@@ -253,9 +269,10 @@ retail size — `$25 per depositary share`, `denominations of $25`, a
 `liquidation preference of $25.00`, a `1/1,000th interest` — in the first
 30,000 characters (a preferred ATM can leave the `$25` that deep; base-
 prospectus mentions of *other* series start later), or the first 4,000 when
-the cover offers common stock. Rights offerings, redemptions, tenders and
-merger prospectuses (`MERGER PROPOSED`, now tier 3 in their own right) are
-exempt, and registration statements still page on form type. The other
+the cover offers common stock. Rights offerings, redemptions and tenders are
+exempt; a merger prospectus (`MERGER PROPOSED`) pages as tier 3 when the deal
+converts, redeems or assumes a preferred or note; and registration
+statements still page on form type. The other
 direction got fixed too: a $25 term sheet that says `Offering Price` rather
 than "public offering" used to page from nothing; it now pages on its size.
 

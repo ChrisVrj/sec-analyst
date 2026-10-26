@@ -53,7 +53,13 @@ import urllib.error
 from datetime import datetime, UTC
 from pathlib import Path
 
-from prefilter import RETAIL_FRACTION_RE, plain_text, retail_amount, should_skip
+from prefilter import (
+    RETAIL_FRACTION_RE,
+    income_security_treatment,
+    plain_text,
+    retail_amount,
+    should_skip,
+)
 from triage import triage_filing
 
 # ---------------------------------------------------------------------------
@@ -865,6 +871,101 @@ def _is_tradeable_new_issue(summary: str,
     return True, ""
 
 
+# ── Tier-3 gate: an M&A ping has to touch his paper ────────────────────────
+# Oct 2026: 22 of the week's 71 pings were M&A, and the model wrote the full
+# "## ⚠️ M&A — CHANGE OF CONTROL" block on 21 of them — BancFirst buying a
+# private bank, Prudential selling its Brazilian business, a Soluna joint
+# venture, Saba's Form 4 on a fund reorganisation, a 10-Q noting a pending
+# merger. The prompt reserves that block for deals affecting preferreds or
+# baby bonds; the model writes it for any deal. BancFirst's post even said so
+# itself: "no public preferreds or baby bonds issued by either party".
+#
+# So tier 3, like tier 2, has to show what it is about. It keeps the ping when
+# the post names the security the deal touches — a preferred, a depositary
+# share, a baby bond, a note by its ticker ("6% 2043 notes (JSM)"), or a
+# substantive **Treatment of preferreds / baby bonds:** field — or, failing
+# that, when the filing itself says what happens to one
+# (prefilter.income_security_treatment). The second reason exists because a
+# deal can touch a preferred the summary forgot to name; it can only keep a
+# ping, never make one. A mention that is denied ("no public preferreds") or
+# marked unaffected ("PRH unaffected") is not evidence.
+#
+# Redemptions (tier 1) and tenders (tier 4) are not gated. A demoted M&A
+# block falls through, so NEWT's private note exchange, posted under a
+# "## 🔁 TENDER / EXCHANGE OFFER" header and a ⚠️ emoji, still pages as a
+# tender.
+_INCOME_SECURITY = re.compile(
+    r"\bpreferreds?\b|\bdepositary\s+(?:shares?|receipts?)\b"
+    r"|\bdepository\s+shares?\b|\bbaby\s+bonds?\b"
+    r"|\bexchange[- ]traded\s+(?:debt|notes?)\b"
+    r"|\b(?:notes?|debentures?)\b[^\n;]{0,40}?"
+    r"\((?-i:(?:NYSE|NASDAQ|Nasdaq)?:?\s*[A-Z]{2,5}(?:[ .\-/]?(?:Pr)?[A-Z])?)\)",
+    re.I,
+)
+# Leading denials — the plain ones in _NEGATION_RE plus the bare "no" that
+# BancFirst's post used ("No." is a number). Not "other than": in a deal it
+# marks the exception, and LXP's merger leaves the Surviving Entity
+# "wholly-owned by Parent (other than in respect of the outstanding Company
+# Series C Preferred Shares)" — the preferred is the thing left standing.
+_DEAL_NEGATION_RE = re.compile(
+    r"\bnot\b|n't\b|\bneither\b|\bnor\b|\bno\b(?!\.)|\bnone\b|\bwithout\b", re.I)
+_UNAFFECTED_RE = re.compile(
+    r"\bunaffected\b|\bnot\s+(?:be\s+)?(?:affected|impacted)\b|\bunchanged\b"
+    r"|\bno\s+(?:change|impact|effect)\b", re.I)
+_TREATMENT_FIELD = re.compile(
+    r"\*\*Treatment of (?:preferreds?|baby bonds?)[^*\n]*\*\*([^\n]*)", re.I)
+_NO_TREATMENT = re.compile(
+    r"^\W*(?:n/?d|n/?a|none|nil|not\s+applicable|no\b)", re.I)
+_COMPANY_LINE = re.compile(r"^\s*Company:\s*(.+?)\s*$", re.I | re.M)
+_CORPORATE_SUFFIX = re.compile(
+    r"(?:[,\s]+(?:inc|incorporated|corp|corporation|co|company|ltd|limited|llc"
+    r"|plc|n\.?a|holdings?|group|trust|/[a-z]{2}/)\.?)+\s*$", re.I)
+
+
+def _names_income_security(summary: str) -> bool:
+    """True if the post names a preferred / depositary share / baby bond /
+    ticker-listed note that something happens to."""
+    for m in _TREATMENT_FIELD.finditer(summary):
+        value = m.group(1).strip(" :")
+        if value and not _NO_TREATMENT.search(value) and not _UNAFFECTED_RE.search(value):
+            return True
+    # The field labels themselves say "preferreds" and "baby bonds", and the
+    # issuer can be called something like "Preferred Bank": neither is
+    # evidence, so both come out before the scan — the name wherever the
+    # headline repeats it.
+    body = _TREATMENT_FIELD.sub("", summary)
+    company = _COMPANY_LINE.search(body)
+    body = "\n".join(l for l in body.splitlines()
+                     if not l.lstrip().lower().startswith("company:"))
+    if company:
+        name = _CORPORATE_SUFFIX.sub("", company.group(1)).strip(" ,.")
+        if len(name) >= 4:
+            body = re.sub(rf"\b{re.escape(name)}\b", " ", body, flags=re.I)
+    for m in _INCOME_SECURITY.finditer(body):
+        lead = body[max(0, m.start() - _NEGATION_WINDOW):m.start()]
+        breaks = list(_CLAUSE_BREAK_RE.finditer(lead))
+        if breaks:
+            lead = lead[breaks[-1].end():]
+        tail = body[m.end():m.end() + _NEGATION_WINDOW]
+        stop = _CLAUSE_BREAK_RE.search(tail)
+        if stop:
+            tail = tail[:stop.start()]
+        if not _DEAL_NEGATION_RE.search(lead) and not _UNAFFECTED_RE.search(tail):
+            return True
+    return False
+
+
+def _deal_touches_income_security(summary: str,
+                                  filing_text: str | None = None) -> tuple[bool, str]:
+    """Tier-3 gate. Returns (keep_urgent, reason_if_demoted)."""
+    if _names_income_security(summary):
+        return True, ""
+    if filing_text and income_security_treatment(plain_text(filing_text)):
+        return True, ""
+    return False, ("names no preferred / depositary share / baby bond it "
+                   "touches, and the filing disposes of none")
+
+
 # ── Calendar-form gate for the lead-emoji signal ───────────────────────────
 # Observed 2026-08-10: two Equitable Holdings posts pinged Chris off the line-1
 # emoji alone, with no highlight block anywhere in the body —
@@ -928,11 +1029,11 @@ def classify_priority(summary: str, form_type: str = "",
     disarms the emoji signal on calendar-driven forms. It defaults to "" —
     unknown forms stay permissive.
 
-    Tier 2 additionally has to clear _is_tradeable_new_issue(), which also
-    checks `filing_text` (the EDGAR payload) when it is given. Tiers 1, 3 and
-    4 are NOT gated: a redemption or tender on something he holds is the whole
-    point of the channel, and a false negative there costs far more than a
-    false positive.
+    Tier 2 additionally has to clear _is_tradeable_new_issue(), and tier 3
+    _deal_touches_income_security(); both also read `filing_text` (the EDGAR
+    payload) when it is given. Tiers 1 and 4 are NOT gated: a redemption or
+    tender on something he holds is the whole point of the channel, and a
+    false negative there costs far more than a false positive.
 
     A demoted rule falls through to the next tier rather than returning, so a
     weak hit on one tier can never suppress a header-backed hit on another.
@@ -962,6 +1063,11 @@ def classify_priority(summary: str, form_type: str = "",
             keep, why = _is_tradeable_new_issue(summary, filing_text)
             if not keep:
                 log.info(f"Demoting new issuance to routine: {why}")
+                continue
+        if tier == 3:
+            keep, why = _deal_touches_income_security(summary, filing_text)
+            if not keep:
+                log.info(f"Demoting M&A to routine: {why}")
                 continue
         return tier, label
     return 0, ""

@@ -36,7 +36,8 @@ Two design rules carried over from the misses:
     (424B*, FWP) prices a single security, and pages only if that security
     shows a retail size — see SUPPLEMENT_FORMS. Scored on form type alone,
     every bank's euro notes and MTNs paged. Registration statements, rights
-    offerings, redemptions, tenders and merger prospectuses are untouched.
+    offerings, redemptions and tenders are untouched; a merger prospectus
+    pages only when the deal disposes of a preferred or note.
 
   · Base forms outrank their own amendments. N-2 is the announcement, N-2/A
     is housekeeping filed weeks later. Across CLM and CRF's last three
@@ -55,6 +56,7 @@ import logging
 import re
 
 from prefilter import (
+    income_security_treatment,
     is_document_maintenance,
     plain_text,
     retail_signal,
@@ -132,9 +134,11 @@ _OFFERED_SECURITY_RE = re.compile(
 # statement/prospectus as a 424B3, and what it registers is the acquirer's
 # common stock, so the takedown rule above would read it as nothing he
 # trades. Until Oct 2026 these paged as "new issuance (form type)"; they now
-# page as what they are. UWM's for Two Harbors (0001140361-26-004996) converts
-# TWO's three preferred series into new UWMC preferred. Matched on the cover's
-# own heading.
+# page as what they are — but only, like every M&A ping, when the deal does
+# something to a preferred, depositary share or note
+# (prefilter.income_security_treatment). UWM's for Two Harbors
+# (0001140361-26-004996) converts TWO's three preferred series into new UWMC
+# preferred. Matched on the cover's own heading.
 _MERGER_PROSPECTUS_RE = re.compile(
     r"merger\s+proposed|proxy\s+statement\s*/\s*prospectus", re.IGNORECASE,
 )
@@ -342,7 +346,12 @@ def triage_filing(form_type, filing_text="", entity_name=""):
 
     if (base_form in SUPPLEMENT_FORMS
             and _MERGER_PROSPECTUS_RE.search(text[:COMMON_COVER_CHARS])):
-        notes.append(f"{base_form} is a merger proxy statement / prospectus")
+        treated = income_security_treatment(text)
+        if not treated:
+            notes.append(f"{base_form} merger prospectus disposes of no "
+                         f"preferred or note — not urgent")
+            return TIER_NONE, "", notes
+        notes.append(f"{base_form} merger prospectus: {treated[:120]!r}")
         return TIER_MERGER, "merger proxy / prospectus (cover)", notes
 
     is_rights = bool(_RIGHTS_OFFERING_RE.search(text))
