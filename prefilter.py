@@ -435,6 +435,53 @@ RETAIL_FRACTION_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# What a deal does to an income security — used by triage.py and the
+# dispatcher's M&A gate, not by should_skip().
+#
+# Oct 2026: 22 of a week's 71 pings were M&A, and most touched nothing he
+# holds — BancFirst buying a private bank, Prudential selling its Brazilian
+# business, Dime buying a $58m bank, a 10-Q mentioning a pending merger. The
+# deals that DID touch his paper say so in a sentence of their own:
+#
+#   "each share of 8.125% Series A ... Preferred Stock ... of Two Harbors ...
+#    will be converted into the right to receive one share of ... UWMC"
+#   "Navient LLC will assume the obligations of the listed notes"
+#   "each share of Providence series B preferred stock ... will be redeemed"
+#
+# The merger prospectuses whose deals touch a listed series state it within
+# their first 8,000 characters (UWMC/TWO 1,934; GNL/Modiv 2,414; PSA/NSA
+# 2,781; Mountain/Corebridge 7,976) — Carlyle Secured Lending's, whose
+# preferred was privately held, only at 101,650. None of the fifteen noise
+# filings that week states it anywhere.
+# Future tense only: "may redeem the notes" is optional-redemption
+# boilerplate in every term sheet, and "required to redeem" is a term
+# preferred's maturity, which triage already scores as a redemption.
+# ---------------------------------------------------------------------------
+_SENTENCE = r"(?:(?!\.\s)[^;]){0,250}?"   # a decimal point is not a full stop
+INCOME_SECURITY_TREATMENT_RE = re.compile(
+    r"\b(?:preferred\s+(?:stock|shares?)|depositary\s+shares?"
+    r"|(?:senior\s+|subordinated\s+)?notes\s+due|debentures)\b" + _SENTENCE +
+    r"\b(?:(?:will|shall)\s+be\s+(?:automatically\s+)?"
+    r"(?:converted|exchanged|redeemed|assumed|cancell?ed|delisted)"
+    r"|converted\s+into|(?:will|shall)\s+remain\s+outstanding)\b"
+    r"|\bassume[sd]?\b(?:(?!\.\s)[^;]){0,80}?"
+    r"\b(?:notes|debentures|preferred\s+(?:stock|shares?)|depositary\s+shares?)\b",
+    re.I,
+)
+TREATMENT_WINDOW = 30_000   # the cover and summary of a merger document
+
+
+def income_security_treatment(text: str) -> str | None:
+    """The sentence in which a deal converts, redeems, assumes or otherwise
+    disposes of a preferred, depositary share or note, or None.
+
+    Reads the first TREATMENT_WINDOW characters. Expects plain_text().
+    """
+    m = INCOME_SECURITY_TREATMENT_RE.search(text[:TREATMENT_WINDOW])
+    return m.group(0) if m else None
+
+
+# ---------------------------------------------------------------------------
 # Document-maintenance supplements — Sep 2026: six JPMorgan 424B3s reached
 # #sec-urgent inside four minutes on the 10th, each one an LLM call, a ping
 # and three paragraphs of the model explaining why it had nothing to say.

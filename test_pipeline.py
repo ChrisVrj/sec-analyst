@@ -840,7 +840,12 @@ check("bare listing headline with no tradeable evidence does NOT ping",
       "tier 2 fails safe to routine; he still sees it in #sec-filings")
 check("M&A headline classifies tier 3",
       dispatch.classify_priority(
-          "**X | 8-K | 2026-08-05** — merger\n## ⚠ M&A — CHANGE OF CONTROL")[0] == 3)
+          "**X | 8-K | 2026-08-05** — merger\n## ⚠ M&A — CHANGE OF CONTROL\n"
+          '> "each share of Series A Preferred Stock will be converted into one '
+          'share of Parent Series A Preferred Stock"')[0] == 3)
+check("…but only when it names the preferred / baby bond it touches (Oct 2026)",
+      dispatch.classify_priority(
+          "**X | 8-K | 2026-08-05** — merger\n## ⚠ M&A — CHANGE OF CONTROL")[0] == 0)
 check("plain housekeeping is routine",
       dispatch.classify_priority("\U0001F4CB **X | 8-K** — bylaw amendment.")[0] == 0)
 check("redemption outranks a co-occurring M&A block",
@@ -887,8 +892,9 @@ check("a merger-vote proxy that quotes COC terms still pings",
           '> "each Series A share converts into one share of Parent\'s '
           'Series D preferred"', "DEF 14A")[0] == 3,
       "the header is evidence; only the bare emoji is disarmed")
-check("DEFM14A is a merger proxy, never gated",
-      dispatch.classify_priority("⚠ **X | DEFM14A | 2026-08-10** — merger vote",
+check("DEFM14A is a merger proxy, never calendar-gated",
+      dispatch.classify_priority("⚠ **X | DEFM14A | 2026-08-10** — merger vote; "
+                                 "Series B preferred converts into Parent preferred",
                                  "DEFM14A")[0] == 3)
 check("an amendment inherits its parent form's gate",
       dispatch.classify_priority("\U0001F6A8 **X | 10-K/A | 2026-08-10** — restated",
@@ -900,7 +906,9 @@ check("an unknown form stays permissive",
 check("a weak hit on one tier cannot suppress a header hit on another",
       dispatch.classify_priority(
           "\U0001F6A8 **X | 10-K | 2026-08-10** — annual report\n"
-          "## ⚠ M&A — CHANGE OF CONTROL", "10-K")[0] == 3)
+          "## ⚠ M&A — CHANGE OF CONTROL\n"
+          '> "the Series A preferred stock will be redeemed at the merger '
+          'effective time"', "10-K")[0] == 3)
 
 mentioned = dispatch.finalize_message(REDEMPTION, WITH_DOC, prefix="@here")
 check("mention prefix is prepended", mentioned.startswith("@here "))
@@ -1909,11 +1917,23 @@ check("M&T's $25 depositary share term sheet pages",
 # Merger prospectuses are filed as 424B3s too, registering the acquirer's
 # common stock. UWM's for Two Harbors converts TWO's three preferred series
 # into new UWMC preferred; it used to page as a "new issuance" by accident.
+TWO_MERGER_PROSPECTUS = (
+    "PROXY STATEMENT/PROSPECTUS MERGER PROPOSED—YOUR VOTE IS VERY IMPORTANT "
+    "To the Stockholders of Two Harbors Investment Corp.: In addition (a) each "
+    "share of 8.125% Series A Fixed-to-Floating Rate Cumulative Redeemable "
+    "Preferred Stock, par value $0.01 per share, of Two Harbors (the &#8220;TWO "
+    "Series A Preferred Stock&#8221;) will be converted into the right to "
+    "receive one share of 8.125% Series A Cumulative Redeemable Preferred "
+    "Stock, par value $0.0001 per share, of UWMC"
+)
 check("a merger proxy statement / prospectus pages as M&A",
-      triage_filing("424B3", "PROXY STATEMENT/PROSPECTUS MERGER PROPOSED—YOUR "
-                             "VOTE IS VERY IMPORTANT To the Stockholders of "
-                             "Two Harbors Investment Corp.")[0:2]
+      triage_filing("424B3", TWO_MERGER_PROSPECTUS)[0:2]
       == (3, "merger proxy / prospectus (cover)"))
+check("…but not one whose deal disposes of no preferred or note",
+      triage_filing("424B3", "PROXY STATEMENT/PROSPECTUS MERGER PROPOSED—YOUR "
+                             "VOTE IS VERY IMPORTANT Each share of Target common "
+                             "stock will be converted into the right to receive "
+                             "0.42 shares of Parent common stock.")[0] == 0)
 
 # The summary path. Verbatim bodies from #sec-urgent, as posted.
 SATS_POST = (
@@ -1986,6 +2006,166 @@ check("…while a filing that does state $25 per depositary share still pages",
       dispatch.classify_priority(
           BAC_WW_POST, "8-K",
           BAC_WW_8K + " Priced at $25 per depositary share.")[0] == 2)
+
+
+# ---------------------------------------------------------------------------
+# Oct 2026 — M&A pings that touch nothing he holds. 22 of the week's 71 pings
+# were tier 3, and 21 of them carried a full "## ⚠️ M&A — CHANGE OF CONTROL"
+# block: the model writes it for any deal, though the prompt reserves it for
+# deals affecting preferreds or baby bonds. Tier 3 now has to name the
+# security the deal touches, or the filing has to say what happens to one.
+#
+# Bodies are the posts as logged — dispatch.log keeps the first 300
+# characters — with the mention stripped. Filing excerpts are verbatim.
+# ---------------------------------------------------------------------------
+print("\nOct 2026 — M&A pings that touch nothing he holds")
+
+NOISE_DEALS = [
+    ("BancFirst buys a private bank — and says so", "8-K",
+     "⚠️ **BANF | 8-K | 2026-10-23** — BancFirst acquires SpiritBank; no public "
+     "preferreds or baby bonds issued by either party\n\nCompany: BancFirst "
+     "Corporation\n\n## ⚠️ M&A — CHANGE OF CONTROL\n> \"Spirit was merged into "
+     "BancFirst upon acquisition.\"\n\n— M&A —\n**Acquirer:** BancFirst Corpo"),
+    ("Prudential sells its Brazil and Mexico businesses", "8-K",
+     "⚠️ **PRU | 8-K | 2026-10-20** — Prudential sells Brazil & Mexico ops to "
+     "CNP Assurances for $4.025B; proceeds for capital priorities\n\nCompany: "
+     "Prudential Financial, Inc.\n\n## ⚠️ M&A — CHANGE OF CONTROL\n> "
+     "\"Prudential Financial, Inc. ... announced that it has entered into "
+     "definitiv"),
+    ("Dime buys a $58m bank", "8-K",
+     "⚠️ **DCOM | 8-K | 2026-10-20** — Dime Commercial Bancshares agrees to "
+     "acquire ES Bancshares in cash-and-stock merger valued ~$58M\n\nCompany: "
+     "DIME COMMERCIAL BANCSHARES, INC. /NY/\n\n## ⚠️ M&A — CHANGE OF CONTROL\n"
+     "> \"The Merger Agreement provides that, upon the terms and subject to "),
+    ("a 10-Q noting a pending merger", "10-Q",
+     "📋 **NEE | 10-Q | 2026-10-21** — Q3 2026 results: NEE net income $4.8B "
+     "(vs $2.4B), FPL net income $1.6B, NEER $1.5B; pending Dominion merger on "
+     "track for H2 2027\n\nCompany: NEXTERA ENERGY INC\n\n## ⚠️ M&A — CHANGE OF "
+     "CONTROL\n> \"Pursuant to the terms and conditions of the merger agr"),
+    ("a joint venture, under the preferred's own ticker", "8-K",
+     "⚠️ **SLNHP | 8-K | 2026-10-21** — Soluna forms JV with Applied Digital "
+     "(51/49) to develop 50 MW AI data center at Dorothy 3 site\n\nCompany: "
+     "Soluna Holdings, Inc.\n\n## ⚠️ M&A — CHANGE OF CONTROL\n> \"Under the "
+     "Transaction Agreement, Soluna is expected to contribute a portion of the "),
+    ("a merger-timing update", "DEFA14A",
+     "⚠️ **WAFD | DEFA14A | 2026-10-23** — WaFd reaffirms merger with EverBank "
+     "on track for year-end close, FY2026 net income $241M\n\nCompany: WAFD INC"
+     "\n\n## ⚠️ M&A — CHANGE OF CONTROL\n> \"We will finalize all this between "
+     "now and the end of December\"\n\n**Acquirer:** EverBank Financial Co"),
+]
+for name, form, body in NOISE_DEALS:
+    tier = dispatch.classify_priority(body, form)[0]
+    check(f"no M&A ping: {name}", tier == 0, f"tier={tier}")
+
+# Listed notes in the cover's 12(b) table are not a deal touching them.
+PRU_8K = (
+    "SECURITIES REGISTERED PURSUANT TO SECTION 12(b) OF THE ACT: Title of Each "
+    "Class Trading Symbol(s) Name of Each Exchange on Which Registered Common "
+    "Stock, Par Value $.01 PRU New York Stock Exchange 5.950% Junior "
+    "Subordinated Notes PRH New York Stock Exchange 5.625% Junior Subordinated "
+    "Notes PRS New York Stock Exchange"
+)
+DCOM_8K = (
+    "Common Stock, $0.01 Par Value DCOM The New York Stock Exchange Preferred "
+    "Stock, Series A, $0.01 Par Value DCOM PR The New York Stock Exchange "
+    "9.00% Junior Subordinated Notes, $25.00 Par Value DCBG The New York Stock "
+    "Exchange. At the effective time of the Merger, each share of common stock "
+    "of ES Bancshares issued and outstanding immediately prior to the Effective "
+    "Time will be converted into the right to receive, at the election of the "
+    "holder thereof, an amount of cash"
+)
+check("…not when the filing only lists PRU's baby bonds on its cover",
+      dispatch.classify_priority(NOISE_DEALS[1][2], "8-K", PRU_8K)[0] == 0)
+check("…nor Dime's preferred, when only ES Bancshares common converts",
+      dispatch.classify_priority(NOISE_DEALS[2][2], "8-K", DCOM_8K)[0] == 0)
+
+REAL_DEALS = [
+    ("Navient's JSM notes assumed by a new issuer", "8-K",
+     "⚠️ **NAVI | 8-K | 2026-10-21** — Navient announces internal reorganization "
+     "to new holding company Navient Holdings; 6% 2043 notes (JSM) assumed by "
+     "Navient LLC\nCompany: Navient Corporation\n\n## ⚠️ M&A — CHANGE OF "
+     "CONTROL\n> \"Upon the completion of the reorganization, Navient LLC w"),
+    ("DigitalBridge deregisters three preferred series", "15-12G",
+     "📋 **DBRG | 15-12G | 2026-10-23** — DigitalBridge files Form 15 to "
+     "terminate registration of its three perpetual preferred series after "
+     "SoftBank merger, ceasing public reporting obligations\n\nCompany: "
+     "DigitalBridge Group, Inc.\n\n## ⚠️ M&A — CHANGE OF CONTROL\n> \"On "
+     "September 30, 20"),
+    ("EverBank's preferred converts into a new WaFd series", "PREM14A",
+     "⚠️ **WAFD | PREM14A | 2026-10-21** — WaFd and EverBank announce merger; "
+     "EverBank preferred converts to new WaFd preferred series\n\nCompany: "
+     "WaFd, Inc.\n\n## ⚠️ M&A — CHANGE OF CONTROL\n> \"at the merger effective "
+     "time each of the 675,000 outstanding shares of Fixed-Rate Reset Non-Cu"),
+    ("Star Equity pays in its listed preferred (emoji, no block)", "S-4",
+     "⚠️ **STRR | S-4 | 2026-10-19** — Star Equity Holdings, Inc. proposes to "
+     "merge Harte Hanks into a wholly-owned subsidiary, offering cash or "
+     "preferred stock consideration.\n\nCompany: Star Equity Holdings, Inc."),
+]
+for name, form, body in REAL_DEALS:
+    tier = dispatch.classify_priority(body, form)[0]
+    check(f"M&A still pings: {name}", tier == 3, f"tier={tier}")
+
+check("a demoted M&A block falls through to the tender header beside it",
+      dispatch.classify_priority(
+          "⚠️ **NEWT | 8-K | 2026-10-21** — NewtekOne privately exchanges $24M of "
+          "8.125% 2027 notes for new 8.125% 2029 senior notes; remaining $26M to "
+          "mature in 2027\n\nCompany: NEWTEKONE, INC.\n\n## 🔁 TENDER / EXCHANGE "
+          "OFFER\n> \"Pursuant to the Agreements, the Company and holders of the "
+          "Seni", "8-K")[0] == 4)
+
+# The M&A body template's own fields. Their labels say "preferreds" and "baby
+# bonds"; only what is written after them counts.
+MA_SHELL = ("⚠️ **X | 8-K | 2026-10-20** — X agrees to acquire Y\n\n"
+            "Company: X Corp\n\n## ⚠️ M&A — CHANGE OF CONTROL\n> \"merger\"\n\n")
+check("'Treatment of preferreds: n/d' is no evidence",
+      dispatch.classify_priority(MA_SHELL + "**Treatment of preferreds:** n/d\n"
+                                 "**Treatment of baby bonds:** n/d", "8-K")[0] == 0)
+check("'…: PRH, PRS, PFH unaffected' is no evidence",
+      dispatch.classify_priority(MA_SHELL + "**Treatment of baby bonds:** PRH, PRS, "
+                                 "PFH unaffected", "8-K")[0] == 0)
+check("'…: converted 1:1 into new WaFd Series B' is",
+      dispatch.classify_priority(MA_SHELL + "**Treatment of preferreds:** converted "
+                                 "1:1 into new WaFd Series B", "8-K")[0] == 3)
+check("a company named 'Preferred …' is no evidence",
+      dispatch.classify_priority("⚠️ **PFBC | 8-K | 2026-10-20** — Preferred Bank "
+                                 "buys a branch\nCompany: Preferred Bank\n\n## ⚠️ M&A "
+                                 "— CHANGE OF CONTROL", "8-K")[0] == 0)
+check("'no impact on the Series A preferred' is a denial",
+      dispatch.classify_priority(MA_SHELL + "No impact on the Series A preferred.",
+                                 "8-K")[0] == 0)
+check("…and 'the preferred remains outstanding, unaffected' is too",
+      dispatch.classify_priority(MA_SHELL + "The Series A preferred remains "
+                                 "outstanding, unaffected.", "8-K")[0] == 0)
+check("LXP's carve-out quoted in the block counts — 'other than' is no denial",
+      dispatch.classify_priority(
+          "⚠️ **LXP | 8-K | 2026-10-19** — LXP Industrial Trust files 8-K to "
+          "supplement proxy statement with additional information regarding "
+          "merger with Leopard REIT LLC.\nCompany: LXP Industrial Trust\n\n"
+          "## ⚠️ M&A — CHANGE OF CONTROL\n> \"Upon completion of the Merger, the "
+          "Surviving Entity will be wholly-owned by Parent (other than in respect "
+          "of the outstanding Company Series C Preferred Shares)\"", "8-K")[0] == 3)
+check("…but 'Series C preferred remain outstanding' at a private successor counts",
+      dispatch.classify_priority(MA_SHELL + "Series C preferred shares remain "
+                                 "outstanding at the private surviving entity.",
+                                 "8-K")[0] == 3)
+
+# The filing gets a vote when the post forgets to name the security.
+check("a filing that converts a preferred keeps a post that forgot to say so",
+      dispatch.classify_priority(MA_SHELL, "8-K", TWO_MERGER_PROSPECTUS)[0] == 3)
+check("…as does one whose new issuer assumes the listed notes (Navient)",
+      dispatch.classify_priority(
+          MA_SHELL, "8-K",
+          "Upon the completion of the reorganization, Navient LLC will assume the "
+          "obligations of the listed notes currently held at the Company and "
+          "continue to be a reporting company.")[0] == 3)
+check("optional-redemption boilerplate is not a deal disposing of anything",
+      prefilter.income_security_treatment(
+          "Optional Redemption: The Company may redeem the notes at any time, at "
+          "its option, in whole or in part. We may not redeem the Series A "
+          "Preferred Stock prior to November 12, 2030.") is None)
+check("…and the treatment has to be near the front of the filing",
+      prefilter.income_security_treatment(
+          "filler. " * 4000 + TWO_MERGER_PROSPECTUS) is None)
 
 
 # ---------------------------------------------------------------------------
