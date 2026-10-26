@@ -1313,6 +1313,54 @@ def move_to_processed(filing_path: Path, prefix: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+def route(body: str, filing: dict) -> tuple[int, str]:
+    """(tier, label) for the body about to be posted; tier 0 is routine."""
+    form_type = filing.get("form_type", "")
+    ticker    = filing.get("ticker", "UNKNOWN")
+    tier, label = classify_priority(body, form_type, filing.get("filing_text", ""))
+
+    # The filing gets a vote of its own. classify_priority reads the model's
+    # wording, which is fine until the model describes the event correctly and
+    # words it differently -- CLM's rights offering had no highlight block at
+    # all, so it routed to the main channel with an accurate summary nobody
+    # read until Monday. triage_filing reads form_type and filing_text, which
+    # do not vary with phrasing. It can only promote: whichever source calls
+    # it more urgent wins.
+    #
+    # The two guards pull in opposite directions on purpose. Reading the
+    # posted body stops a ping the reader cannot see the reason for; reading
+    # the filing stops a miss the reader never learns about. Neither one
+    # weakens the other, because this can only ever promote.
+    det_tier, det_label, det_notes = triage_filing(
+        form_type, filing.get("filing_text", ""), filing.get("entity_name", ""))
+    if det_tier and (tier == 0 or det_tier < tier):
+        # ...with one exception, and it is the invariant above: a new-issue
+        # ping must not contradict the post it rides on. Goldman's MOBU index
+        # supplement (0001193125-26-427988) pinged on 2026-10-22 with
+        # "**Listing:** UNLISTED" in plain sight, because triage scored every
+        # 424B2 a tier 2. Triage no longer does that, but a post that says
+        # UNLISTED is the reader's own evidence and outranks the form type.
+        # Rights offerings are exempt, as everywhere else.
+        rights = "rights" in det_label or any("rights" in n for n in det_notes)
+        if det_tier == 2 and not rights and _LISTING_UNLISTED.search(body):
+            log.info(f"Not promoting {ticker} {form_type} to P2 ({det_label}): "
+                     f"the post itself says Listing: UNLISTED")
+            return tier, label
+        log.info(
+            f"Promoting {ticker} {form_type} to P{det_tier} from the filing "
+            f"itself ({det_label}); summary alone gave "
+            f"{'P' + str(tier) if tier else 'routine'}"
+        )
+        for note in det_notes:
+            log.info(f"  {note}")
+        tier, label = det_tier, det_label
+    return tier, label
+
+
+# ---------------------------------------------------------------------------
 # Dispatch one filing
 # ---------------------------------------------------------------------------
 
@@ -1398,32 +1446,7 @@ def dispatch(filing_path: Path) -> int:
         move_to_processed(filing_path, prefix="err_")
         return provider["sleep"]
 
-    tier, priority_label = classify_priority(
-        body, form_type, filing.get("filing_text", ""))
-
-    # The filing gets a vote of its own. classify_priority reads the model's
-    # wording, which is fine until the model describes the event correctly and
-    # words it differently -- CLM's rights offering had no highlight block at
-    # all, so it routed to the main channel with an accurate summary nobody
-    # read until Monday. triage_filing reads form_type and filing_text, which
-    # do not vary with phrasing. It can only promote: whichever source calls
-    # it more urgent wins.
-    #
-    # The two guards pull in opposite directions on purpose. Reading the
-    # posted body stops a ping the reader cannot see the reason for; reading
-    # the filing stops a miss the reader never learns about. Neither one
-    # weakens the other, because this can only ever promote.
-    det_tier, det_label, det_notes = triage_filing(
-        form_type, filing.get("filing_text", ""), filing.get("entity_name", ""))
-    if det_tier and (tier == 0 or det_tier < tier):
-        log.info(
-            f"Promoting {ticker} {form_type} to P{det_tier} from the filing "
-            f"itself ({det_label}); summary alone gave "
-            f"{'P' + str(tier) if tier else 'routine'}"
-        )
-        for note in det_notes:
-            log.info(f"  {note}")
-        tier, priority_label = det_tier, det_label
+    tier, priority_label = route(body, filing)
 
     is_urgent = tier > 0
 
