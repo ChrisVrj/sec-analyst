@@ -1524,11 +1524,17 @@ check("an S-3 that says the same no longer pages",
 # The hedge still holds. "Unless we inform you otherwise..." is base-prospectus
 # boilerplate about a security class, not a statement about this offering —
 # the AGNC / Rithm failure mode, and the reason unlisted_statement() exists.
+# (Until Oct 2026 the takedown here was common stock. A common-stock takedown
+# no longer pages on form type at all — see "Oct 2026" below — so the hedge
+# is proven on a $25 preferred instead, which is the takedown it protects.)
 check("hedged shelf boilerplate does not demote a shelf takedown",
       triage_filing("424B5",
                     "Unless we inform you otherwise in the applicable prospectus "
                     "supplement, the debt securities will not be listed on any "
-                    "securities exchange. We are offering common stock.")[0] == 2)
+                    "securities exchange. We are offering 4,000,000 depositary "
+                    "shares, each representing a 1/1,000th interest in a share "
+                    "of 6.50% Series C Preferred Stock ($25 per depositary "
+                    "share).")[0] == 2)
 
 # The RIV failure mode, one layer up. A CEF rights prospectus carries a line
 # about preferred shares that may not be listed at first; it must not silence
@@ -1614,6 +1620,372 @@ check("a real change-of-control trigger event is not scrubbed",
       "trigger event" in dispatch.render_body(
           "\U0001F4E2 **ABC | 8-K | 2026-09-10** \u2014 change of control\n"
           "A change of control trigger event occurred on September 1.", 1900))
+
+
+# ---------------------------------------------------------------------------
+# Oct 2026 — pinged for paper he does not trade. In the week to 2026-10-23,
+# 71 posts mentioned Chris in #sec-urgent; he screenshotted four kinds that
+# had no business there: Citi's euro notes, NRUC's $2,000 MTNs, a Goldman
+# index supplement addendum, and Strive's $100-stated-amount SATS preferred.
+#
+# Three separate faults, each with its own fix:
+#   · the text arrived with HTML entities in it ("Denominations&#58;",
+#     "&#128;100,000"), and nothing could match across them
+#   · the denomination reader knew only "$", only the "Denominations:" field,
+#     and took the bare words "depositary share" as proof of retail
+#   · triage paged every 424B and FWP on form type alone
+#
+# What he does trade, in his own examples: BofA's Series SS and Goldman's
+# Series D depositary shares ("each representing a 1/1,000th interest"), and
+# NRUC's 5.500% notes due 2064 ("denominations of $25.00"). Fixtures are the
+# real text, entities and all, verbatim from EDGAR.
+# ---------------------------------------------------------------------------
+print("\nOct 2026 — pinged for paper he does not trade")
+
+check("strip_html decodes every entity, not just four",
+      edgar_poller.strip_html("<td>Denominations&#58;</td> $2,000 x $1,000 "
+                              "&#128;100,000 &ldquo;SATS.&rdquo;")
+      == "Denominations: $2,000 x $1,000 €100,000 “SATS.”")
+check("…after the tags are gone, so a decoded '<' is never read as markup",
+      edgar_poller.strip_html("<p>5 &lt;b&gt; 6</p>") == "5 <b> 6")
+
+NRUC_MTN_FWP = (
+    "FWP 1 dealermtnfwp3yroctober2026.htm DEALER MTN FWP 3 YR OCTOBER 2026 "
+    "Document Filed Pursuant to Rule 433 under the Securities Act Registration "
+    "Statement No. 333-299452 Issuer Free Writing Prospectus dated October 21, "
+    "2026 CUSIP #&#58; 63743HGK2 ISIN#&#58; US63743HGK23 NATIONAL RURAL "
+    "UTILITIES COOPERATIVE FINANCE CORPORATION Medium-Term Notes, Series D "
+    "With Maturities of Nine Months or More from Date of Issue Fixed Rate Notes "
+    "Issuer&#58; National Rural Utilities Cooperative Finance Corporation "
+    "Principal Amount&#58; $400,000,000 Security Type&#58; Senior Unsecured "
+    "Interest Rate&#58; 5.40% Issue Price&#58; 99.885% of Principal Amount "
+    "Huntington Securities, Inc. M&#38;T Securities, Inc. Form of Note&#58; "
+    "Book-Entry (Book-Entry or Certificated) Denominations&#58; $2,000 x $1,000 "
+    "Other Terms&#58; None"
+)
+CITI_EUR_424B2 = (
+    "The 2030 notes will be limited initially to an aggregate principal amount "
+    "of &#128;1,500,000,000 and the 2033 notes will be limited initially to an "
+    "aggregate principal amount of &#128;1,250,000,000. The notes will be "
+    "issued only in fully registered form without coupons, in denominations of "
+    "&#128;100,000 and integral multiples of &#128;1,000 in excess thereof. "
+    "Application will be made to list the notes on the regulated market of the "
+    "Luxembourg Stock Exchange, but Citigroup cannot assure you that the notes "
+    "will be approved for listing and is not required to maintain this listing."
+)
+CITI_EUR_FWP = (
+    "FWP 1 d146197dfwp.htm FWP FWP F ILED PURSUANT TO RULE 433 "
+    "&#8195;&#8195;&#8195;&#8195;File No. 333-293732 C ITIGROUP I NC . "
+    "&#128;1,250,000,000 4.462% Fixed Rate / Floating Rate Callable Senior "
+    "Notes Due 2033 Terms and Conditions Issuer: Citigroup Inc. Listing: "
+    "Application will be made to list the notes on the regulated market of the "
+    "Luxembourg Stock Exchange. Settlement: Euroclear / Clearstream Minimum "
+    "Denominations/Multiples: &#128;100,000 / multiples of &#128;1,000 in "
+    "excess thereof Governing Law: State of New York"
+)
+WMT_MAPLE_FWP = (
+    "FWP 1 d503593dfwp.htm FWP FWP Filed Pursuant to Rule 433 File No. "
+    "333-275878 FINAL TERM SHEET Dated October 19, 2026 WALMART INC. "
+    "C$750,000,000 4.150% Notes Due 2030 C$2,000,000,000 4.450% Notes Due 2033 "
+    "Aggregate Principal Amount: C$750,000,000 (2030 Notes) C$2,000,000,000 "
+    "(2033 Notes) Issue Price (Price to Public): 99.996% of aggregate principal "
+    "amount (2030 Notes)"
+)
+BNY_SERIES_O_FWP = (
+    "FWP 1 d150356dfwp.htm FWP FWP Issuer Free Writing Prospectus Filed "
+    "pursuant to Rule 433 Registration Statement No. 333-282710 October 19, "
+    "2026 THE BANK OF NEW YORK MELLON CORPORATION 1,250,000 Depositary Shares, "
+    "Each Representing a 1/100 th Interest in a Share of Series O "
+    "Noncumulative Perpetual Preferred Stock Size: $1,250,000,000 (1,250,000 "
+    "depositary shares) Liquidation Preference: $1,000 per depositary share "
+    "(equivalent to $100,000 per share of Preferred Stock) Public Offering "
+    "Price: $1,000 per depositary share"
+)
+BNY_SERIES_O_424B2 = (
+    "If we redeem the Series O Preferred Stock, the depositary will redeem a "
+    "proportionate number of depositary shares. Neither the depositary shares "
+    "nor shares of the Series O Preferred Stock will be listed on any "
+    "securities exchange or automated quotation system."
+)
+GS_INDEX_ADDENDUM = (
+    "424B3 1 blackrock_addendum_octob.htm 424B3 424B3 &#160; October 2026 "
+    "BlackRock &#174; &#160;Dynamic Factor Index Supplement Addendum to the "
+    "BlackRock &#174; &#160;Dynamic Factor Index Supplement, the Prospectus "
+    "Supplement and the Prospectus, each as may be amended from time to time, "
+    "that form a part of Registration Statement No. 333-284538 Filed Pursuant "
+    "to Rule 424(b)(3) GS Finance Corp. Medium-Term Notes, Series F guaranteed "
+    "by The Goldman Sachs Group, Inc."
+)
+GS_MOBU_INDEX_SUPPLEMENT = (
+    "424B2 1 mobu_note_october_2026.htm 424B2 424B2 Filed Pursuant to Rule "
+    "424(b)(2) Registration Statement No. 333-284538 MOBU Focus ER Index "
+    "Supplement No. 16 to the Prospectus and the Prospectus Supplement, each as "
+    "may be amended from time to time, that form a part of Registration "
+    "Statement No. 333-284538 GS Finance Corp. Medium-Term Notes, Series F"
+)
+
+for name, form, text, why in [
+    ("NRUC's $2,000 MTN term sheet", "FWP", NRUC_MTN_FWP, "institutional"),
+    ("Citi's euro notes", "424B2", CITI_EUR_424B2, "non-USD"),
+    ("Citi's euro term sheet", "FWP", CITI_EUR_FWP, "non-USD"),
+    ("Walmart's Maple bonds", "FWP", WMT_MAPLE_FWP, "non-USD"),
+    ("BNY's $1,000 depositary shares", "FWP", BNY_SERIES_O_FWP, "institutional"),
+    ("BNY's 'neither ... will be listed'", "424B2", BNY_SERIES_O_424B2, "unlisted"),
+    ("Goldman's index supplement addendum", "424B3", GS_INDEX_ADDENDUM, "index supplement"),
+    ("Goldman's numbered index supplement", "424B2", GS_MOBU_INDEX_SUPPLEMENT, "index supplement"),
+]:
+    skip, reason = prefilter.should_skip(
+        {"form_type": form, "entity_name": "ISSUER", "filing_text": text})
+    check(f"{name} is dropped before the LLM call", skip and why in reason,
+          f"skip={skip} reason={reason!r}")
+
+# His examples, cover text verbatim, each riding on a base prospectus that
+# restates an institutional denomination for some other class of debt.
+BAC_SERIES_SS = (
+    "424B5 1 d278452d424b5.htm 424B5 424B5 Table of Contents Filed pursuant to "
+    "Rule 424(b)(5) Registration No. 333-257399 28,000,000 Depositary Shares, "
+    "Each Representing a 1/1,000 th Interest in a Share of 4.750% "
+    "Non-Cumulative Preferred Stock, Series SS Bank of America Corporation is "
+    "offering 28,000,000 depositary shares, each representing a 1/1,000 th "
+    "interest in a share of our perpetual 4.750% Non-Cumulative Preferred "
+    "Stock, Series SS, $0.01 par value, with a liquidation preference of "
+    "$25,000 per share (equivalent to $25 per depositary share). We intend to "
+    "apply to list the depositary shares on the New York Stock Exchange (the "
+    "&#8220;NYSE&#8221;) under the symbol &#8220;BAC PrS.&#8221; "
+    + "filler. " * 400 +
+    "Form and Denomination of Debt Securities Unless we specify otherwise in "
+    "the applicable supplement, the debt securities will be issued in minimum "
+    "denominations of $1,000 and integral multiples of $1,000 in excess of "
+    "$1,000."
+)
+GS_SERIES_D = (
+    "424B2 1 e21362b2e424b2.htm PROSPECTUS SUPPLEMENT DATED MAY 16, 2006-SERIES "
+    "D PREFERRED STOCK 424B2 The Goldman Sachs Group, Inc. 30,000,000 "
+    "Depositary Shares Each Representing 1/1,000 th Interest in a Share of "
+    "Floating Rate Non-Cumulative Preferred Stock, Series D Each of the "
+    "30,000,000 depositary shares offered hereby represents a 1/1,000 th "
+    "ownership interest in a share of perpetual Floating Rate Non-Cumulative "
+    "Preferred Stock, Series D (&#8220;Series D Preferred Stock&#8221;), "
+    "$25,000 liquidation preference per share"
+)
+NRUC_2064_NOTES = (
+    "Prospectus Supplement (To prospectus dated November 1, 2017) National "
+    "Rural Utilities Cooperative Finance Corporation $250,000,000 5.500% "
+    "Subordinated Notes due 2064 (Subordinated Deferrable Interest Notes) The "
+    "Notes will be issued only in denominations of&#8201; $25.00 and integral "
+    "multiples in excess thereof. "
+    + "filler. " * 400 +
+    "Unless specified otherwise in the prospectus supplement or pricing "
+    "supplement, all senior debt securities will be denominated in U.S. "
+    "dollars, registered senior debt securities will be issued in "
+    "denominations of $1,000 and multiples of $1,000 and bearer senior debt "
+    "securities will be issued in denominations of $5,000 and multiples of "
+    "$5,000. (Sections 201 and 302)"
+)
+
+for name, form, text in [("BofA Series SS", "424B5", BAC_SERIES_SS),
+                         ("Goldman Series D", "424B2", GS_SERIES_D),
+                         ("NRUC 5.500% notes due 2064", "424B5", NRUC_2064_NOTES)]:
+    skip, reason = prefilter.should_skip(
+        {"form_type": form, "entity_name": "ISSUER", "filing_text": text})
+    check(f"{name} survives the prefilter", not skip, f"dropped as {reason!r}")
+    check(f"{name} pages from the filing itself",
+          triage_filing(form, text)[0] == 2, str(triage_filing(form, text)))
+
+check("a $25 baby bond survives an UNHEDGED $2,000 sentence about other debt",
+      not prefilter.should_skip({
+          "form_type": "424B5", "entity_name": "ISSUER",
+          "filing_text": "The notes will be issued in denominations of $25 and "
+                         "integral multiples of $25. " + "filler. " * 400 +
+                         "The senior notes due 2031 were issued in minimum "
+                         "denominations of $2,000 and integral multiples of "
+                         "$1,000."})[0],
+      "a retail amount anywhere vetoes the institutional read")
+check("'$25,000 per share' is not a $25 retail amount",
+      prefilter.retail_amount(prefilter.plain_text(
+          "has a liquidation preference of $25,000 per share")) is None)
+check("…nor is 'denominations of $250,000'",
+      prefilter.retail_amount("in minimum denominations of $250,000") is None)
+check("the old pattern's blind spot: 'denominations OF $2,000'",
+      prefilter.offered_denomination(
+          "The notes will be issued in minimum denominations of $2,000 and "
+          "integral multiples of $1,000 in excess thereof.")[0] == "institutional")
+check("prose 'denominations of $1,000' alone is the indenture default, not a tell",
+      prefilter.offered_denomination(
+          "the Debt Securities of each series will be issued only in registered "
+          "form without coupons and in denominations of $1,000 and integral "
+          "multiples thereof (Section 302)")[0] == "")
+check("a 1/25th depositary share is not a retail fraction",
+      prefilter.retail_signal("Depositary Shares, Each Representing a 1/25 th "
+                              "Interest in a Share of 7.200% Fixed-Rate Reset "
+                              "Non-Cumulative Preferred Stock, Series WW") is None)
+check("a stated $1,000 per depositary share outranks a stray 1/1,000th",
+      prefilter.retail_signal("Liquidation Preference: $1,000 per depositary "
+                              "share. Our Series SS depositary shares each "
+                              "represent a 1/1,000th interest.") is None)
+
+# Strive's SATS: Nasdaq-listed, $100 stated amount, an ATM. It still reaches
+# #sec-filings — it is a listed preferred — but it does not page.
+SATS_ATM = (
+    "424B5 1 dp255515_424b5.htm FORM 424B5 Filed Pursuant to Rule 424(b)(5) "
+    "Registration No. 333-290252 PROSPECTUS SUPPLEMENT (To Prospectus dated "
+    "September 15, 2025) STRIVE, INC. Up to $1,000,000,000 of 15.00% Series A "
+    "Perpetual SATS Preferred Stock We have entered into a Controlled Equity "
+    "Offering SM Sales Agreement with Cantor Fitzgerald & Co. Our SATS Stock "
+    "is listed on The Nasdaq Global Market under the trading symbol "
+    "&ldquo;SATS.&rdquo; On October 23, 2026, the last reported sale price of "
+    "our SATS Stock as reported on The Nasdaq Global Market was $94.88 per "
+    "share. The SATS Stock accumulates cumulative dividends at a rate per "
+    "annum equal to 15.00% on the stated amount thereof, which is $100 per "
+    "share of SATS Stock. "
+    + "filler. " * 400 +
+    "if other than denominations of $1,000 or multiples of $1,000, the "
+    "denominations the debt securities will be issued in"
+)
+check("SATS still reaches #sec-filings",
+      not prefilter.should_skip({"form_type": "424B5", "entity_name": "STRIVE",
+                                 "filing_text": SATS_ATM})[0])
+check("SATS does not page on form type",
+      triage_filing("424B5", SATS_ATM)[0] == 0, str(triage_filing("424B5", SATS_ATM)))
+
+# Common stock. The prompt has always said he must not be alerted about it;
+# triage paged every common-stock takedown anyway. Alpine's common ATM
+# (0001104659-26-118484) describes its existing $25 preferred 133,828
+# characters in — and the preferred ATM filed the same minute pages.
+ALPINE_COMMON_ATM = (
+    "424B5 1 tm2626043d4_424b5.htm 424B5 Filed Pursuant to Rule 424(b)(5) "
+    "PROSPECTUS SUPPLEMENT (To Prospectus dated October 15, 2026) $150,000,000 "
+    "Alpine Income Property Trust, Inc. Common Stock We have entered into "
+    "separate equity distribution agreements relating to the offer and sale "
+    "of shares of our common stock. " + "filler. " * 4000 +
+    "8.00% Series A Cumulative Redeemable Preferred Stock, with a liquidation "
+    "preference of $25.00 per share"
+)
+ALPINE_PREFERRED_ATM = (
+    "424B5 1 tm2626043d3_424b5.htm 424B5 Filed Pursuant to Rule 424(b)(5) "
+    "PROSPECTUS SUPPLEMENT (To Prospectus dated October 15, 2026) Up to "
+    "$35,000,000 Alpine Income Property Trust, Inc. 8.00% Series A Cumulative "
+    "Redeemable Preferred Stock (Liquidation Preference $25.00 per share)"
+)
+check("a common-stock ATM no longer pages on form type",
+      triage_filing("424B5", ALPINE_COMMON_ATM)[0] == 0)
+check("the same issuer's preferred ATM does",
+      triage_filing("424B5", ALPINE_PREFERRED_ATM)[0] == 2)
+
+# A preferred ATM's cover lists the series and their tickers and can leave
+# the $25 to the description: NYMT's (0001104659-25-059349) states it 28,345
+# characters in. A BDC baby bond's cover can spend itself on what a BDC is:
+# CION's 7.50% notes (0001104659-26-010385), 11,099.
+NYMT_PREFERRED_ATM = (
+    "PROSPECTUS SUPPLEMENT Up to $50,000,000 of 8.000% Series D "
+    "Fixed-to-Floating Rate Cumulative Redeemable Preferred Stock 7.875% "
+    "Series E Fixed-to-Floating Rate Cumulative Redeemable Preferred Stock "
+    "Our Series D Preferred Stock is listed on Nasdaq under the symbol "
+    "&#8220;NYMTN.&#8221; " + "filler. " * 3500 +
+    "liquidation preference of $25.00 per share"
+)
+check("a preferred ATM with its $25 deep in the supplement still pages",
+      triage_filing("424B5", NYMT_PREFERRED_ATM)[0] == 2)
+
+check("Walmart's USD notes term sheet does not page",
+      triage_filing("FWP", "FINAL TERM SHEET WALMART INC. $750,000,000 5.050% "
+                           "Notes Due 2029 Aggregate Principal Amount: "
+                           "$750,000,000 Spread to Benchmark Treasury: +20 "
+                           "basis points")[0] == 0)
+# ...and a $25 term sheet now does, even though it never says "public
+# offering" — which is all an FWP used to need, and M&T's never had.
+check("M&T's $25 depositary share term sheet pages",
+      triage_filing("FWP", "FWP 1 d835782dfwp.htm FWP FWP Filed Pursuant to "
+                           "Rule 433 Registration No. 333-274646 May 6, 2024 "
+                           "M&T Bank Corporation 30,000,000 Depositary Shares, "
+                           "Each Representing a 1/400th Interest in a Share of "
+                           "Perpetual 7.500% Non-Cumulative Preferred Stock, "
+                           "Series J Pricing Term Sheet Liquidation Preference: "
+                           "$10,000 liquidation preference per Preferred Share "
+                           "(equivalent to $25 per Depositary Share) Aggregate "
+                           "Offering Size: $750,000,000 Offering Price: $25 per "
+                           "Depositary Share")[0] == 2)
+
+# Merger prospectuses are filed as 424B3s too, registering the acquirer's
+# common stock. UWM's for Two Harbors converts TWO's three preferred series
+# into new UWMC preferred; it used to page as a "new issuance" by accident.
+check("a merger proxy statement / prospectus pages as M&A",
+      triage_filing("424B3", "PROXY STATEMENT/PROSPECTUS MERGER PROPOSED—YOUR "
+                             "VOTE IS VERY IMPORTANT To the Stockholders of "
+                             "Two Harbors Investment Corp.")[0:2]
+      == (3, "merger proxy / prospectus (cover)"))
+
+# The summary path. Verbatim bodies from #sec-urgent, as posted.
+SATS_POST = (
+    "\U0001F4E2 **SATS | 424B5 | 2026-10-26** — Strive launches $1B ATM "
+    "for 15% perpetual preferred (SATS) on Nasdaq\n"
+    "Company: Strive, Inc.\n\n"
+    '## \U0001F4E2 LISTING: PUBLIC — NASDAQ SYMBOL "SATS"\n'
+    '> "Our SATS Stock is listed on The Nasdaq Global Market under the trading '
+    'symbol &ldquo;SATS.&rdquo;"\n\n'
+    "**Product:** preferred stock (15.00% Series A Perpetual SATS Preferred Stock)\n"
+    '**Listing:** PUBLIC (NASDAQ) symbol "SATS"\n'
+    "**Coupon:** 15.00% fixed\n"
+    "**Par:** $100.00 (stated amount)\n"
+    "**Maturity:** perpetual\n"
+    "**Size:** up to $1,000,000,000"
+)
+CITI_POST = (
+    "\U0001F4C4 **C | 424B2 | 2026-10-21** — Citigroup prices €2.75bn "
+    "dual-tranche EUR senior notes (2030/2033), LuxSE listing only\n"
+    "Company: Citigroup Inc.\n\n"
+    '## \U0001F4E2 LISTING: PUBLIC — LUXEMBOURG STOCK EXCHANGE SYMBOL "n/d"\n'
+    '> "Application will be made to list each series of notes on the Official '
+    'List of the Luxembourg Stock Exchange."\n\n'
+    "**Product:** senior note (EUR fixed-to-floating)\n"
+    '**Listing:** PUBLIC (Luxembourg Stock Exchange) symbol "n/d"\n'
+    "**Par:** €100,000 (minimum) + €1,000 increments"
+)
+check("SATS's post is routine — $100 stated amount",
+      dispatch.classify_priority(SATS_POST, "424B5")[0] == 0,
+      str(dispatch.classify_priority(SATS_POST, "424B5")))
+check("Citi's post is routine — euro par, Luxembourg listing",
+      dispatch.classify_priority(CITI_POST, "424B2")[0] == 0,
+      str(dispatch.classify_priority(CITI_POST, "424B2")))
+check("a Luxembourg-only listing is demoted even with a $25 par",
+      not dispatch._is_tradeable_new_issue(
+          "## LISTING: PUBLIC — LUXEMBOURG STOCK EXCHANGE\n"
+          "**Product:** preferred stock\n**Par:** $25.00")[0])
+check("a $1,000-per-share par that is $25 per depositary share still pages",
+      dispatch._is_tradeable_new_issue(
+          "## LISTING: PUBLIC — NYSE\n**Product:** depositary shares\n"
+          "**Par:** $1,000 per share (equivalent to $25 per depositary share)")[0],
+      "the old pattern demoted this on the leading $1,000")
+check("…and so does '$25,000 per share' over a 1/1,000th depositary share",
+      dispatch._is_tradeable_new_issue(
+          "## LISTING: PUBLIC — NYSE\n**Product:** depositary shares, each "
+          "a 1/1,000th interest\n**Par:** $25,000 per share")[0])
+
+# BofA's Series WW 8-K. The post said "($25 par)"; the filing says $25,000 per
+# share, and the depositary shares were 1/25th each — $1,000, unlisted. The
+# summary may only claim a retail size the filing states somewhere.
+BAC_WW_POST = (
+    "\U0001F4E2 **BAC PrWW | 8-K | 2026-10-23** — BAC prices 2M depositary "
+    "shares of new 7.200% Fixed-Rate Reset Series WW preferred ($25 par)\n"
+    "Company: Bank of America Corp\n\n"
+    '## \U0001F4E2 LISTING: PUBLIC — NYSE SYMBOL "BAC PrWW"\n'
+    "**Product:** depositary shares (preferred stock)\n**Par:** $25.00"
+)
+BAC_WW_8K = (
+    "Depositary Shares, each representing a 1/1,000th interest in a share of "
+    "6.000% Non-Cumulative Preferred Stock, Series GG BAC PrB New York Stock "
+    "Exchange. The Certificate of Designations fixes the designations of the "
+    "Corporation&#8217;s 7.200% Fixed-Rate Reset Non-Cumulative Preferred "
+    "Stock, Series WW. The Series WW Preferred Stock has a liquidation "
+    "preference of $25,000 per share."
+)
+check("BofA's WW 8-K does not page on a $25 the filing never states",
+      dispatch.classify_priority(BAC_WW_POST, "8-K", BAC_WW_8K)[0] == 0,
+      str(dispatch.classify_priority(BAC_WW_POST, "8-K", BAC_WW_8K)))
+check("…while a filing that does state $25 per depositary share still pages",
+      dispatch.classify_priority(
+          BAC_WW_POST, "8-K",
+          BAC_WW_8K + " Priced at $25 per depositary share.")[0] == 2)
 
 
 # ---------------------------------------------------------------------------

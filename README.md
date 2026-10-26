@@ -214,10 +214,16 @@ genuinely quotes change-of-control terms still pings on its header.
 **New issuances (tier 2) additionally have to be tradeable**, or they demote to
 the main channel. The target is exchange-listed income securities at retail
 denomination — $25-par preferreds, depositary shares, baby bonds. A filing is
-demoted when its body shows `Listing: UNLISTED`, `Par: $1,000` (institutional
-paper, even if NYSE-listed), `Product: common stock`, or no preferred /
-depositary / baby-bond / $25-par signal at all. Redemptions, M&A and tender
-offers are **not** gated — a missed call notice costs more than a spare ping.
+demoted when its body shows `Listing: UNLISTED`, a `Par:` that is not a retail
+amount (`$1,000` institutional paper even if NYSE-listed, Strive's `$100.00
+(stated amount)` SATS, Citi's `€100,000`), a listing only on a non-US exchange
+(Luxembourg), `Product: common stock`, or no preferred / depositary /
+baby-bond / $25-par signal at all. The summary's retail claim also has to be
+in the filing: BofA's Series WW 8-K pinged as "($25 par)" when the filing
+says `$25,000 per share` and the depositary shares were $1,000 each, so a
+tier 2 needs the filing itself to state a retail amount somewhere. Redemptions,
+M&A and tender offers are **not** gated — a missed call notice costs more than
+a spare ping.
 
 The one common-share exception is a **CEF or BDC rights offering**, which has
 its own tier-2 rule (🧨) and is deliberately **not** gated: shares outstanding
@@ -236,6 +242,22 @@ exchange-traded debt"* contains three retail signals and means the opposite of
 all three. A retail match now only counts when nothing negates it in the same
 clause — one un-negated mention is enough, so *"not common stock; they are $25
 par baby bonds"* is unaffected.
+
+**A takedown pages only if it is retail.** `triage.py` used to score every
+`424B*` a tier 2 on form type alone, and every FWP that named an "aggregate
+principal amount". In the week to 2026-10-23 that was 18 of the 71 pings —
+Citi's euro notes, NRUC's and Walmart's MTNs, Goldman's index supplements,
+BNY's $1,000 depositary shares, common-stock ATMs. A prospectus supplement or
+term sheet now pages from the filing only when the security it prices shows a
+retail size — `$25 per depositary share`, `denominations of $25`, a
+`liquidation preference of $25.00`, a `1/1,000th interest` — in the first
+30,000 characters (a preferred ATM can leave the `$25` that deep; base-
+prospectus mentions of *other* series start later), or the first 4,000 when
+the cover offers common stock. Rights offerings, redemptions, tenders and
+merger prospectuses (`MERGER PROPOSED`, now tier 3 in their own right) are
+exempt, and registration statements still page on form type. The other
+direction got fixed too: a $25 term sheet that says `Offering Price` rather
+than "public offering" used to page from nothing; it now pages on its size.
 
 **An offering that says it will never trade is not urgent, on any form.** The
 filing-side guard scored every `424B*` a tier 2 on form type and can only
@@ -293,7 +315,16 @@ most, and both are tuned against real filings:
 | Index supplements and prospectus addenda | what the document calls itself on its cover |
 | Structured notes (autocallable, buffer, participation rate, underlier) | payoff vocabulary |
 | Explicitly unlisted offerings | "will not be listed…", and the term-sheet field `Listing: None` |
-| $1,000-and-up paper | a stated `Denominations: $1,000` / `Minimum Denomination: $1,000`, with no $25-par or depositary-share signal anywhere |
+| $1,000-and-up paper | a stated `Denominations: $2,000 x $1,000` field, `minimum denominations of $2,000`, or `$1,000 per depositary share`, with no retail amount (`$25 per depositary share`, `denominations of $25`) or retail fraction (`1/1,000th`) anywhere |
+| Non-USD paper | a denomination or principal amount in another currency — `denominations of €100,000`, `Aggregate Principal Amount: C$750,000,000` |
+
+All of it is matched on decoded text. Until Oct 2026 the poller decoded four
+HTML entities and passed the rest through, so NRUC's `Denominations&#58;
+$2,000` and Citi's `&#128;100,000` could not match anything, and the model
+quoted `&ldquo;SATS.&rdquo;` into Discord verbatim. Prose `denominations of
+$1,000` does **not** count on its own: it is the indenture default every base
+prospectus restates, and a base prospectus rides along behind every $25-par
+takedown.
 
 **A 424B3 usually isn't an offering.** The banks file two kinds of supplement
 in bulk that price nothing at all:

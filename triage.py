@@ -32,6 +32,12 @@ Two design rules carried over from the misses:
     tier. Coupons, ratios and prices are extracted where they parse and
     omitted where they do not, and a parse failure is logged, not raised.
 
+    One exception since Oct 2026: a prospectus supplement or term sheet
+    (424B*, FWP) prices a single security, and pages only if that security
+    shows a retail size — see SUPPLEMENT_FORMS. Scored on form type alone,
+    every bank's euro notes and MTNs paged. Registration statements, rights
+    offerings, redemptions, tenders and merger prospectuses are untouched.
+
   · Base forms outrank their own amendments. N-2 is the announcement, N-2/A
     is housekeeping filed weeks later. Across CLM and CRF's last three
     offerings the three sessions after the base N-2 were negative in 6 of 6
@@ -48,7 +54,12 @@ being watched.
 import logging
 import re
 
-from prefilter import is_document_maintenance, unlisted_statement
+from prefilter import (
+    is_document_maintenance,
+    plain_text,
+    retail_signal,
+    unlisted_statement,
+)
 
 log = logging.getLogger("DISPATCH")
 
@@ -56,6 +67,7 @@ log = logging.getLogger("DISPATCH")
 # 0 means nothing structural was found.
 TIER_REDEMPTION = 1
 TIER_NEW_ISSUE = 2
+TIER_MERGER = 3
 TIER_TENDER = 4
 TIER_NONE = 0
 
@@ -74,6 +86,58 @@ CAPITAL_RAISE_FORMS = frozenset({
 # Shelf housekeeping and Rule 482 advertising. Mostly annual updates and
 # marketing, so these reach a tier only when the text names an offering.
 SOFT_FORMS = frozenset({"486APOS", "486BPOS", "497", "497K", "497AD", "FWP"})
+
+# --- A takedown pages only when it is a security he trades ----------------
+# The registration forms above page on form type alone: a new shelf is wanted
+# loud (see test_pipeline.py, "shelf registrations — louder on purpose").
+# A prospectus supplement is different. It prices ONE security, and the
+# question is whether that security is in his universe — which the form type
+# cannot answer, because every bank, utility and REIT files 424Bs.
+#
+# Scored on form type alone they produced 18 of the 71 pings in the week to
+# 2026-10-23: Citi's euro notes, NRUC's and Walmart's MTNs, Goldman's index
+# supplements, BNY's $1,000 depositary shares, a common-stock ATM, Wheeler's
+# proxy supplements — and on the 26th Strive's $100-stated-amount SATS
+# preferred ATM. The genuine retail takedowns that week (OXLC's term
+# preferred, PINE's preferred ATM) state their $25 size on the first page.
+#
+# So a 424B or FWP now pages only on a retail signal — a $25 amount, a $25
+# denomination, a 1/1,000th depositary fraction (prefilter.retail_signal) —
+# read near the front, where the security being offered is described. This
+# is NOT the summary-side gate that silenced CLM: it reads the filing, not the
+# model's words, and a rights offering is exempt before it is ever consulted.
+#
+# How near the front was measured on 333 EDGAR full-text hits for $25 paper:
+# most state it in the first 4,000 characters, but a preferred ATM's cover
+# lists the series and their tickers and leaves the $25 to the description
+# (NYMT 28,345, MFA 25,813), and a BDC baby bond can spend the cover on what
+# a BDC is (CION 11,099). No institutional or non-traded supplement in the
+# sample showed a retail signal before 60,000 (Phoenix Energy One's
+# non-traded notes) — those are base-prospectus mentions of OTHER series. A
+# common-stock cover gets only its first page, since the description of some
+# existing preferred can sit much nearer the front (CareCloud's common ATM
+# 27,748; Alpine's 133,828).
+SUPPLEMENT_FORMS = frozenset({
+    "424B1", "424B2", "424B3", "424B4", "424B5", "424B7", "424B8", "FWP",
+})
+RETAIL_EVIDENCE_CHARS = 30_000
+COMMON_COVER_CHARS = 4_000
+_OFFERED_SECURITY_RE = re.compile(
+    r"common\s+(?:stock|shares)|preferred|depositary|depository"
+    r"|\bnotes?\b|debentures|\bunits\b",
+    re.IGNORECASE,
+)
+
+# A merger is registered on the same forms. The acquirer files its proxy
+# statement/prospectus as a 424B3, and what it registers is the acquirer's
+# common stock, so the takedown rule above would read it as nothing he
+# trades. Until Oct 2026 these paged as "new issuance (form type)"; they now
+# page as what they are. UWM's for Two Harbors (0001140361-26-004996) converts
+# TWO's three preferred series into new UWMC preferred. Matched on the cover's
+# own heading.
+_MERGER_PROSPECTUS_RE = re.compile(
+    r"merger\s+proposed|proxy\s+statement\s*/\s*prospectus", re.IGNORECASE,
+)
 
 # --- Tender and exchange offers -------------------------------------------
 # A Schedule TO is a standing bid for a security that already trades, at a
@@ -226,13 +290,25 @@ def describe_targets(targets):
     return line
 
 
+def offered_retail_security(text):
+    """The retail signal for the security a supplement offers, or None.
+
+    Reads the first RETAIL_EVIDENCE_CHARS — or only the first
+    COMMON_COVER_CHARS when the first security the cover names is common
+    stock. Expects plain_text().
+    """
+    first = _OFFERED_SECURITY_RE.search(text[:COMMON_COVER_CHARS])
+    common = bool(first) and first.group(0).lower().startswith("common")
+    return retail_signal(text[:COMMON_COVER_CHARS if common else RETAIL_EVIDENCE_CHARS])
+
+
 def triage_filing(form_type, filing_text="", entity_name=""):
     """Classify from the filing itself. Returns (tier, label, notes).
 
     `notes` is a list of short strings explaining the tier, for the log.
     """
     base_form, is_amendment = split_form(form_type)
-    text = filing_text or ""
+    text = plain_text(filing_text)
     notes = []
 
     # A redemption is a fact about a security that already trades, so it
@@ -263,6 +339,11 @@ def triage_filing(form_type, filing_text="", entity_name=""):
             + (" (amendment — terms of a live offer)" if is_amendment else "")
         )
         return TIER_TENDER, "tender / exchange offer (form type)", notes
+
+    if (base_form in SUPPLEMENT_FORMS
+            and _MERGER_PROSPECTUS_RE.search(text[:COMMON_COVER_CHARS])):
+        notes.append(f"{base_form} is a merger proxy statement / prospectus")
+        return TIER_MERGER, "merger proxy / prospectus (cover)", notes
 
     is_rights = bool(_RIGHTS_OFFERING_RE.search(text))
     if is_rights:
@@ -299,8 +380,36 @@ def triage_filing(form_type, filing_text="", entity_name=""):
                 notes.append(f"{base_form} states {unlisted!r} — nothing to "
                              f"trade, so not urgent on form type alone")
                 return TIER_NONE, "", notes
+            # A takedown has to be a security he trades — see SUPPLEMENT_FORMS.
+            if base_form in SUPPLEMENT_FORMS:
+                retail = offered_retail_security(text)
+                if not retail:
+                    notes.append(f"{base_form} offers nothing at retail "
+                                 f"denomination — not urgent on form type alone")
+                    return TIER_NONE, "", notes
+                notes.append(f"{base_form} offers a retail-denominated "
+                             f"security ({retail!r})")
         notes.append(f"{base_form} registers or prices new securities")
         return TIER_NEW_ISSUE, "new issuance (form type)", notes
+
+    # A term sheet pages on what it prices. Until Oct 2026 an FWP needed only
+    # to name an offering — and NRUC's MTN term sheets, Walmart's notes and
+    # Citi's euro notes all name an "aggregate principal amount" — while the
+    # $25 term sheets he wanted never did: M&T's Series J (0001193125-24-
+    # 132472) says "Offering Price: $25 per Depositary Share", not "public
+    # offering", and stayed silent.
+    if base_form in SOFT_FORMS and base_form in SUPPLEMENT_FORMS and not is_rights:
+        retail = offered_retail_security(text)
+        if not retail:
+            notes.append(f"{base_form} prices nothing at retail denomination")
+            return TIER_NONE, "", notes
+        unlisted = unlisted_statement(text)
+        if unlisted:
+            notes.append(f"{base_form} states {unlisted!r} — nothing to trade")
+            return TIER_NONE, "", notes
+        notes.append(f"{base_form} prices a retail-denominated security "
+                     f"({retail!r})")
+        return TIER_NEW_ISSUE, "new issuance (retail term sheet)", notes
 
     if base_form in SOFT_FORMS and (is_rights or _OFFERING_RE.search(text)):
         notes.append(f"{base_form} naming an offering")
