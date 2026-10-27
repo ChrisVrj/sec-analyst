@@ -5,12 +5,18 @@ filing day, matches filings against your watchlist, calls an LLM for a
 fixed-income-analyst summary, and posts to Discord.
 
 **Coverage:** one long-running job polls every 15 seconds through EDGAR's
-entire filing day. Times are evaluated in Sofia local time, so the EEST/EET
-switch needs no maintenance.
+entire filing day. Times are evaluated in New York time — the clock EDGAR
+keeps — so both DST switches need no maintenance and the open never drifts.
 
-| Session | Sofia | ET |
+| Session | ET | Sofia |
 |---|---|---|
-| Mon–Fri | 13:00 – 05:00 next day | 06:00 – 22:00 |
+| Mon–Fri | 06:00 – 22:00 | 13:00 – 05:00 next day |
+| …while US/EU clocks are out of step (≈3 weeks in March, ≈1 week Oct/Nov) | 06:00 – 22:00 | **12:00** – 04:00 next day |
+
+Nothing exists on EDGAR before 06:00 ET, so there is no earlier start to be
+had. Until Oct 2026 the session was pinned to 13:00 Sofia and opened an hour
+late in the out-of-step weeks: MFIC's 8-K on the ARCC merger was accepted at
+06:40 ET (12:40 Sofia) on 2026-10-27, inside that hour.
 
 That is EDGAR's filing day end to end. Until Sep 2026 this was two narrow
 windows — 06:00–11:00 and 16:00–20:00 ET — with **five uncovered hours across
@@ -22,8 +28,9 @@ same day, found itself between windows, and exited after six seconds.
 to 11 hours in a bad stretch** — measured, not theoretical (see AGENTS.md §6).
 Three things compensate:
 
-- a trigger landing within 2 hours *before* the session holds the runner and
-  opens with it (`(armed early)` in the run log)
+- a trigger landing up to 5h15m *before* the open holds the runner and opens
+  with it (`(armed early)` in the run log) — that is from 07:45 Sofia, or 06:45
+  in the out-of-step weeks
 - a job runs to the session end or its 5h45m ceiling, so a 16-hour session is
   two or three chained jobs rather than hundreds of short ones
 - **every run starts with a catch-up sweep**, in or out of session — see below

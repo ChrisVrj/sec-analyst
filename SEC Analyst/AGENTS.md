@@ -196,7 +196,7 @@ The watchlist. Maps tickers to CIK numbers — this is what determines which com
 The orchestrator. See §6 for the full scheduling story — this has been rewritten twice in this project already because of a GitHub-specific gotcha.
 
 Current structure (rewritten Sep 2026 — the step is now `Check trading session`):
-1. **`Check trading session`** step (id: `window`) — computes Sofia local time and day-of-week in bash and emits **three** outputs, not one: `mode` (`live` | `catchup` | `skip`), `live`, and `catchup`. The three-way split is the point: a trigger that lands outside the session is no longer wasted, it becomes a catch-up run.
+1. **`Check trading session`** step (id: `window`) — computes New York time and day-of-week in bash and emits **three** outputs, not one: `mode` (`live` | `catchup` | `skip`), `live`, and `catchup`. The three-way split is the point: a trigger that lands outside the session is no longer wasted, it becomes a catch-up run.
 2. `Checkout`, `Set up Python`, both cache-restore steps and the log upload carry `if: steps.window.outputs.mode != 'skip'`. Only Sunday, and Monday before the open, are `skip` — those are the only slots with no EDGAR activity behind them.
 3. **`Catch-up sweep`** (`if: catchup == 'true'`) runs `python edgar_poller.py --catchup` and dispatches whatever it recovers. It runs **before** the live loop and independently of it, so an out-of-session trigger still delivers. This step is what makes the cron cadence survivable — see §6.
 4. **`Poll and dispatch loop`** (`if: live == 'true'`) idles until the session opens if armed early, then runs a bash `while` loop until the session end or the job's 5h45m budget, calling `python edgar_poller.py --once` every 15 seconds and running `python openrouter_dispatch.py` whenever anything lands in `filings-inbox/`. **Every 20th cycle it runs a 1-hour `--catchup` sweep instead of a plain poll**, because a dispatch cycle can take minutes (LLM latency × N filings) while the feed's newest page covers under six minutes at peak — a busy patch can outrun the live read, and this heals it in place. Logs (`edgar_poller.log`, `dispatch.log`) are uploaded as a workflow artifact (7-day retention).
@@ -208,23 +208,24 @@ Current structure (rewritten Sep 2026 — the step is now `Check trading session
 
 ## 4. Trading session / schedule (current target)
 
-Chris is based in **Sofia, Bulgaria**. The session is defined and evaluated in **Sofia local time** (Aug 2026 rewrite — previously UTC minute constants):
+Chris is based in **Sofia, Bulgaria**, but the session is defined and evaluated in **New York time** (Oct 2026 rewrite — previously Sofia local time, before that UTC minute constants):
 
-| Session | Sofia local | ET equivalent |
+| Session | ET | Sofia equivalent |
 |---|---|---|
-| Mon–Fri | 13:00 – 05:00 next day | 06:00 – 22:00 ET |
+| Mon–Fri | 06:00 – 22:00 ET | 13:00 – 05:00 next day |
+| …while US/EU DST is out of step | 06:00 – 22:00 ET | 12:00 – 04:00 next day |
 
-That is EDGAR's filing day end to end: 06:00 ET is its first filing minute, 22:00 ET its last. The session spans midnight and its 00:00–05:00 half is valid **Tue–Sat**, because that half belongs to the *preceding* weekday. Saturday 00:00–05:00 is Friday's US after-hours (wanted); Monday 00:00–05:00 would be Sunday's (not wanted, and excluded).
+That is EDGAR's filing day end to end: 06:00 ET is its first filing minute, 22:00 ET its last. In ET it is a single calendar day, so Friday's after-hours (Saturday early morning in Sofia) is simply Friday.
+
+**⚠ Oct 2026: why ET and not Sofia.** The session used to be "13:00 Sofia", which equals 06:00 ET only while the clocks agree. The US switches DST on the 2nd Sunday of March and 1st Sunday of November, the EU on the last Sundays of March and October; in between (2–3 weeks in spring, about one in autumn) EDGAR opens at **12:00 Sofia** and the poller started an hour late. On **2026-10-27** MFIC's 8-K announcing its merger into ARCC (`0001193125-26-432622`) was accepted at **06:40 ET = 12:40 Sofia**, inside that hour. The earlier note here called the drift "not worth compensating for"; it was, and computing in ET removes it entirely.
 
 **⚠ Sep 2026: this replaced two narrow windows, and the reason matters.** The old schedule ran 06:00–11:00 and 16:00–20:00 ET, leaving **11:00–16:00 ET — five hours across the middle of the US session — with no coverage at all**. Nuveen's NMCO rights offering (`497AD`, `0001999371-26-018939`) was filed at **13:51 ET on 2026-08-27**, inside that hole. Run #2013 was created at 13:51 ET the same day, evaluated the two windows, found itself between them, and exited after six seconds. The hole was never a deliberate choice; it was left over from an era when the windows were sized around OpenRouter rate limits that no longer apply. Runtime on a public repo is free, so there is no reason not to cover the whole filing day.
 
-**Why the session starts at 13:00 and not earlier.** EDGAR only accepts filings **06:00–22:00 ET**, and Sofia 13:00 *is* 06:00 ET in both aligned DST regimes — the earliest minute at which a filing can exist. Do not move the start earlier; there is nothing there to find. (The window was 11:00–16:00 Sofia until Aug 2026, which spent its first two hours polling a system that wasn't accepting filings.)
+**Why polling starts at 06:00 ET and not earlier.** EDGAR only accepts filings **06:00–22:00 ET** — the earliest minute at which a filing can exist. Do not move the start earlier; there is nothing there to find (press releases on Business Wire etc. often go out before 06:00 ET, but they are not on EDGAR and this pipeline does not read newswires). The way to be "earlier" is to have the runner **already armed** when EDGAR opens — see the look-ahead in §6. (The window was 11:00–16:00 Sofia until Aug 2026, which spent its first two hours polling a system that wasn't accepting filings.)
 
 **A 16-hour session against a 6-hour job ceiling.** One job runs to the session end or 5h45m, whichever comes first, so a full session is two or three chained jobs. Chaining is free when a trigger is parked as pending behind the running job; when the cron goes quiet it is the catch-up sweep, not the chain, that keeps filings from being lost.
 
-During the 2–3 weeks each spring/autumn when US and EU clocks are out of step, Sofia 13:00 lands on 07:00 ET rather than 06:00 — still live, just an hour into the day. Not worth compensating for.
-
-**DST is no longer a manual step.** All window arithmetic happens in Sofia local time via the runner's tzdata, so the EEST/EET switch needs no edits. A sanity check asserts the offset is `+0300` or `+0200` and emits a GitHub `::warning::` otherwise — if tzdata ever vanished from the runner image, `TZ=` silently yields UTC and every boundary would shift 2–3 hours, which is exactly the kind of silent breakage this project keeps getting bitten by.
+**DST is not a manual step.** All window arithmetic happens in `America/New_York` via the runner's tzdata, so neither switch needs edits. A sanity check asserts the offset is `-0400` or `-0500` and emits a GitHub `::warning::` otherwise — if tzdata ever vanished from the runner image, `TZ=` silently yields UTC and every boundary would shift 4–5 hours, which is exactly the kind of silent breakage this project keeps getting bitten by. (Git Bash on Windows has no tzdata, so replaying the step locally trips this warning; substitute the POSIX rules `EST5EDT,M3.2.0,M11.1.0` / `EET-2EEST,M3.5.0/3,M10.5.0/4` to test there.)
 
 ---
 
@@ -266,12 +267,14 @@ During the 2–3 weeks each spring/autumn when US and EU clocks are out of step,
 The 2-hour pre-session look-ahead cannot bridge a 9-hour trigger gap, and no amount of tuning it will. **So the fix is not scheduling, it is recovery: every run now begins with a `--catchup` sweep that pages backwards through the feed and queues anything on the watchlist it has never seen — in session or out of it.** A cron gap now costs latency instead of the filing. The 13:51 ET trigger that exited in six seconds would have delivered NMCO under the current design.
 
 **Consequence, and the earlier partial fix: pre-window arming.** With a ~2h trigger cadence, a window is covered only if a trigger happens to land inside it. On 2026-08-06 none landed between 21:39 and 03:27 and **the entire night window was missed**. So a trigger landing shortly *before* a window now holds the runner and opens with the window instead of exiting:
-- Look-ahead `MAX_WAIT_SECONDS` = 2h, matched to the observed cadence.
+- Look-ahead `MAX_WAIT_SECONDS` = **5h15m** (Oct 2026; was 2h) — as far as the job ceiling allows while leaving 30 min of polling. Arming opens at 00:45 ET = 07:45 Sofia (06:45 in the out-of-step weeks).
 - `MAX_TOTAL_SECONDS` = 5h45m covers wait + polling combined, against the 6h job ceiling (`timeout-minutes: 350`).
 - A wait that would leave under 30 min of polling is not worth a runner, so it skips.
 - Replayed against the real 2026-08-06 triggers: 12:14 arms and covers the full 13:00–18:00, and 21:39 arms and covers the full 23:00–03:00.
 
-**Cost of arming:** the job holds a hosted runner while idle, up to 2h. Public-repo minutes are unlimited so this is free, but it is genuinely idle capacity — keep the look-ahead proportionate and don't extend arming to cover the whole day.
+**⚠ Why the look-ahead went from 2h to 5h15m (Oct 2026).** On 2026-10-27 GitHub created exactly two runs between the overnight close and mid-afternoon: #2387 at **03:38 ET** (09:38 Sofia) and #2388 at **09:32 ET** (15:32 Sofia). #2387 was 2h22m from the open, beyond the 2h look-ahead, so it swept and exited. MFIC's 8-K (06:40 ET) and Bread Financial's preferred-offering 8-K (08:12 ET) both reached Discord only at 15:33 Sofia, via #2388's catch-up. Under the new gate #2387 arms, opens at 06:00 ET and polls until 09:23 ET, catching both live.
+
+**Cost of arming:** the job holds a hosted runner while idle, up to 5h15m. Public-repo minutes are unlimited so this is free. Arming never costs coverage: any trigger that lands while an armed job idles is parked as the pending run and starts the moment the armed job ends, evaluating the clock afresh. The only trade is that an armed job early in the night has less polling budget left after the open — and the pending run covers that.
 
 **What arming cannot fix:** runs #1220 and #1221 both died after exactly 15m02s with `The job was not acquired by Runner of type hosted even after multiple attempts` plus an `Internal server error` correlation ID. That is GitHub failing to allocate a runner, entirely server-side, and no workflow change addresses it. The mitigation is the `*/5` backstop plus the parked pending run — both of which need GitHub's scheduler to be working at all.
 
@@ -448,7 +451,7 @@ If asked to revise this prompt again, **read the actual current `SYSTEM_PROMPT` 
 - **Discord channel:** `#sec-filings`
 - **SEC contact email (in User-Agent):** `chrisdoesdocu@gmail.com`
 - **LLM provider:** NVIDIA NIM / Nemotron 3 (primary, free tier), OpenRouter free models (automatic fallback)
-- **Trading windows (Sofia local):** 13:00–18:00 and 23:00–03:00, Mon–Fri (= 06:00–11:00 and 16:00–20:00 ET). Continuous polling every 15s for the whole window, one long job per window.
+- **Trading session (New York time):** 06:00–22:00 ET, Mon–Fri (= 13:00–05:00 Sofia, or 12:00–04:00 while US/EU DST is out of step). Continuous polling every 15s, one long job per ≤5h45m, armed up to 5h15m before the open.
 - **Core files:** `edgar_poller.py` (fetch+extract), `prefilter.py` (noise filter), `openrouter_dispatch.py` (summarize+post), `cik_map.json` (watchlist), `.github/workflows/poll.yml` (orchestration/schedule)
 - **State files (must stay cached across Actions runs):** `seen_accessions.json`, `dispatched_accessions.json`
 - **Queue directories:** `filings-inbox/` (pending), `filings-inbox/processed/` (done — prefixed `skip_`/`err_`/`dup_` to indicate why/how it left the queue)

@@ -33,13 +33,23 @@ name: EDGAR SEC Poller
 # 4. EVERY RUN STARTS WITH A CATCH-UP SWEEP, in or out of the session. This is
 #    the piece that makes the cron cadence survivable — see below.
 #
-# THE SESSION (Sofia local — tzdata handles EEST/EET, nothing to edit at the
-# DST switch):
+# THE SESSION is EDGAR's filing day, evaluated in NEW YORK time:
 #
-#   13:00 Sofia → 05:00 Sofia next day, Mon-Fri  =  06:00 - 22:00 ET
+#   06:00 - 22:00 ET, Mon-Fri
+#   = 13:00 - 05:00 Sofia most of the year
+#   = 12:00 - 04:00 Sofia while the US and EU clocks are out of step
+#     (2-3 weeks in March, about a week around late Oct / early Nov)
 #
-# That is EDGAR's filing day end to end: 06:00 ET is its first filing minute,
-# 22:00 ET its last. There is no longer a gap in the middle.
+# 06:00 ET is EDGAR's first filing minute; nothing can exist before it, so
+# polling earlier finds nothing (edgar_poller.py's own edgar_is_open() guard
+# would refuse anyway). Computing in ET makes the open track EDGAR through
+# both DST switches with nothing to edit.
+#
+# ⚠ WHY ET AND NOT SOFIA (Oct 2026). The session used to be "13:00 Sofia",
+# which is only 06:00 ET while the clocks agree. In the out-of-step weeks
+# EDGAR opens at 12:00 Sofia and we started an hour late. On 2026-10-27 (EU
+# already on winter time, US not) MFIC's 8-K announcing the ARCC merger was
+# accepted at 06:40 ET = 12:40 Sofia — inside that hour.
 #
 # ⚠ WHY THE OLD TWO-WINDOW SCHEDULE WAS REPLACED (Sep 2026). It ran
 # 06:00-11:00 and 16:00-20:00 ET and left 11:00-16:00 ET — five hours across
@@ -47,10 +57,6 @@ name: EDGAR SEC Poller
 # offering (497AD, 0001999371-26-018939) was filed at 13:51 ET on 2026-08-27,
 # inside that hole. A cron trigger landed at 13:51 ET that day, evaluated the
 # windows, found itself between them, and exited after six seconds.
-#
-# During the 2-3 weeks each spring/autumn when US and EU clocks are out of
-# step, Sofia 13:00 lands on 07:00 ET instead of 06:00 — still live, just an
-# hour later. Not worth compensating for.
 #
 # COST: public repo = unlimited Actions minutes. SEC sees ~3 feed requests per
 # 15s poll (0.2 req/s against their 10 req/s limit). NVIDIA sees at most 30
@@ -76,28 +82,30 @@ jobs:
       - name: Check trading session
         id: window
         run: |
-          # Everything is computed in Sofia local time, so EEST/EET is handled
-          # by tzdata. This replaced four UTC constants that had to be
-          # hand-edited on the last Sunday of March and October.
-          read -r SOFIA_H SOFIA_M SOFIA_DOW <<< "$(TZ=Europe/Sofia date +'%-H %-M %u')"
-          SOFIA_MIN=$(( SOFIA_H * 60 + SOFIA_M ))
-          SOFIA_OFFSET=$(TZ=Europe/Sofia date +%z)
+          # Everything is computed in New York time, because that is the clock
+          # EDGAR keeps; tzdata handles EDT/EST. Computing in Sofia time (until
+          # Oct 2026) opened an hour late whenever the US and EU DST switches
+          # were out of step. Sofia is still printed, for reading the log.
+          read -r ET_H ET_M ET_DOW <<< "$(TZ=America/New_York date +'%-H %-M %u')"
+          ET_MIN=$(( ET_H * 60 + ET_M ))
+          ET_OFFSET=$(TZ=America/New_York date +%z)
 
-          echo "Sofia $(TZ=Europe/Sofia date '+%H:%M %a') (UTC$SOFIA_OFFSET)  dow=$SOFIA_DOW  min=$SOFIA_MIN"
+          echo "ET $(TZ=America/New_York date '+%H:%M %a') (UTC$ET_OFFSET) = Sofia $(TZ=Europe/Sofia date '+%H:%M %a')  dow=$ET_DOW  min=$ET_MIN"
 
           # Guard: if the runner ever loses tzdata, TZ= silently yields UTC and
-          # the session would shift 2-3 hours. Make that loud, not silent.
-          case "$SOFIA_OFFSET" in
-            +0300|+0200) ;;
-            *) echo "::warning title=Sofia timezone lookup failed::Offset '$SOFIA_OFFSET' is neither +0300 nor +0200 — tzdata missing? Session boundaries are unreliable." ;;
+          # the session would shift 4-5 hours. Make that loud, not silent.
+          case "$ET_OFFSET" in
+            -0400|-0500) ;;
+            *) echo "::warning title=New York timezone lookup failed::Offset '$ET_OFFSET' is neither -0400 nor -0500 — tzdata missing? Session boundaries are unreliable." ;;
           esac
 
-          # Session bounds in Sofia minutes-past-midnight.
-          SESSION_START=780   # 13:00 Sofia = 06:00 ET, EDGAR's first filing minute
-          SESSION_END=300     # 05:00 Sofia = 22:00 ET, EDGAR's last, next day
+          # Session bounds in ET minutes-past-midnight. It is one calendar day,
+          # so there is no past-midnight half to special-case.
+          SESSION_START=360    # 06:00 ET, EDGAR's first filing minute
+          SESSION_END=1320     # 22:00 ET, EDGAR's last
 
           # Budget. A job may run 6h; leave headroom for checkout/setup/upload.
-          MAX_WAIT_SECONDS=7200      # 2h — longest we'll idle waiting to open
+          MAX_WAIT_SECONDS=18900     # 5h15m — longest we'll idle waiting to open
           MAX_TOTAL_SECONDS=20700    # 5h45m of wait + polling combined
           MIN_USEFUL_SECONDS=1800    # don't bother waiting for <30 min of polling
 
@@ -113,20 +121,10 @@ jobs:
             # manual run must not hold the concurrency slot for five hours.
             WINDOW="manual"
             MODE="live"
-            END_MIN=$(( SOFIA_MIN + 10 ))
+            END_MIN=$(( ET_MIN + 10 ))
 
-          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -ge "$SESSION_START" ]; then
-            # Evening-side of the session. Run straight through midnight to
-            # 05:00 so one job covers as much of it as its 6h ceiling allows.
-            WINDOW="session 13:00-05:00"
-            MODE="live"
-            END_MIN=$(( 1440 + SESSION_END ))
-
-          elif [ "$SOFIA_DOW" -ge 2 ] && [ "$SOFIA_DOW" -le 6 ] && [ "$SOFIA_MIN" -lt "$SESSION_END" ]; then
-            # After-midnight half. Valid Tue-Sat because it belongs to the
-            # PRECEDING weekday's session — Sat 00:00-05:00 is Friday's US
-            # after-hours and is wanted; Mon 00:00-05:00 is Sunday's and is not.
-            WINDOW="session 13:00-05:00 (past midnight)"
+          elif [ "$ET_DOW" -le 5 ] && [ "$ET_MIN" -ge "$SESSION_START" ] && [ "$ET_MIN" -lt "$SESSION_END" ]; then
+            WINDOW="session 06:00-22:00 ET"
             MODE="live"
             END_MIN=$SESSION_END
 
@@ -138,25 +136,30 @@ jobs:
           # and 02:05 Sofia, so RiverNorth's RIV rights offering — filed at
           # 16:52 ET, inside the old night window — had no runner listening.
           #
-          # So when a trigger lands shortly BEFORE the session, hold the runner
-          # and open with it rather than exiting and hoping for another trigger
-          # that may never come.
-          elif [ "$SOFIA_DOW" -le 5 ] && [ "$SOFIA_MIN" -lt "$SESSION_START" ]; then
-            WINDOW="session 13:00-05:00 (armed early)"
+          # So when a trigger lands BEFORE the open, hold the runner and open
+          # with it rather than exiting and hoping for another trigger that may
+          # never come. The look-ahead is as long as the job ceiling allows.
+          # It used to be 2h: on 2026-10-27 the only morning trigger landed at
+          # 03:38 ET, 2h22m before the open, ran a catch-up and exited; the next
+          # was created at 09:32 ET, three hours after MFIC's 8-K. Arming costs
+          # no coverage — any trigger that lands while this job waits is parked
+          # as the pending run and takes over the moment this one ends.
+          elif [ "$ET_DOW" -le 5 ] && [ "$ET_MIN" -lt "$SESSION_START" ]; then
+            WINDOW="session 06:00-22:00 ET (armed early)"
             MODE="live"
-            WAIT_MIN=$(( SESSION_START - SOFIA_MIN ))
-            WIN_LEN_MIN=$(( 1440 + SESSION_END - SESSION_START ))
+            WAIT_MIN=$(( SESSION_START - ET_MIN ))
+            WIN_LEN_MIN=$(( SESSION_END - SESSION_START ))
           fi
 
           WAIT_SECONDS=$(( WAIT_MIN * 60 ))
           RUN_SECONDS=0
 
           # Monday before the open is the one pre-session slot with nothing
-          # behind it — the last session ended Saturday 05:00 Sofia, further
-          # back than any catch-up horizon reaches. Every other weekday's
+          # behind it — the last session ended Friday 22:00 ET, further back
+          # than any catch-up horizon reaches. Every other weekday's
           # pre-session hours sit right after the previous night's close.
           TOO_FAR_MODE="catchup"
-          [ "$SOFIA_DOW" -eq 1 ] && TOO_FAR_MODE="skip"
+          [ "$ET_DOW" -eq 1 ] && TOO_FAR_MODE="skip"
 
           if [ "$MODE" = "live" ] && [ "$WAIT_MIN" -gt 0 ]; then
             if [ "$WAIT_SECONDS" -gt "$MAX_WAIT_SECONDS" ]; then
@@ -177,31 +180,30 @@ jobs:
             fi
 
           elif [ "$MODE" = "live" ]; then
-            RUN_SECONDS=$(( (END_MIN - SOFIA_MIN) * 60 ))
+            RUN_SECONDS=$(( (END_MIN - ET_MIN) * 60 ))
             # Clamp: never negative (clock races at a boundary), never beyond
             # the job timeout.
             [ "$RUN_SECONDS" -lt 60 ] && RUN_SECONDS=60
             [ "$RUN_SECONDS" -gt "$MAX_TOTAL_SECONDS" ] && RUN_SECONDS=$MAX_TOTAL_SECONDS
-            echo "Session: $WINDOW — polling for $(( RUN_SECONDS / 60 )) min (until Sofia $(( END_MIN / 60 % 24 )):$(printf '%02d' $(( END_MIN % 60 ))))"
+            echo "Session: $WINDOW — polling for $(( RUN_SECONDS / 60 )) min (until Sofia $(TZ=Europe/Sofia date -d "@$(( $(date +%s) + RUN_SECONDS ))" '+%H:%M'))"
           fi
 
           # ── Is a catch-up sweep worth running? ───────────────────────────
-          # Yes whenever EDGAR could have been open behind us. The session runs
-          # Sofia 13:00 Mon through Sofia 05:00 Sat, so anything from Monday
-          # afternoon to Saturday can have unrecovered filings behind it.
-          # Sunday, and Monday before the open, cannot.
+          # Yes whenever EDGAR could have been open behind us: anything from
+          # Monday 06:00 ET through the weekend after Friday's close. Sunday,
+          # and Monday before the open, cannot.
           #
           # This is what makes a stray trigger useful instead of wasted. The
           # 13:51 ET trigger on 2026-08-27 that exited in six seconds would
           # have delivered NMCO's rights offering had this step existed.
           if [ "$MODE" != "skip" ]; then
             CATCHUP=true
-          elif [ "$SOFIA_DOW" -ge 2 ] && [ "$SOFIA_DOW" -le 6 ]; then
-            CATCHUP=true
-            MODE="catchup"
-          else
+          elif [ "$ET_DOW" -eq 7 ] || { [ "$ET_DOW" -eq 1 ] && [ "$ET_MIN" -lt "$SESSION_START" ]; }; then
             CATCHUP=false
             echo "Sunday, or Monday before the open — nothing can be behind us. Skipping."
+          else
+            CATCHUP=true
+            MODE="catchup"
           fi
 
           echo "Mode: $MODE (catch-up sweep: $CATCHUP)"
