@@ -1413,6 +1413,36 @@ check("filing path promotes it, as now requested",
                               "$250 million of common shares, preferred "
                               "shares, notes and subscription rights.")[0] == 2)
 
+# …but a post-effective amendment that takes a shelf DOWN is not a new issue.
+# Navient LLC, 2026-10-29: six POSASRs after its holding-company reorg, each
+# pinged. Abridged from 0001193125-26-436981.
+NAVI_DEREG = (
+    "POST-EFFECTIVE AMENDMENT NO. 1 TO FORM S-3 REGISTRATION STATEMENT NO. "
+    "333-286944 Navient LLC DEREGISTRATION OF SECURITIES These Post-Effective "
+    "Amendments No. 1 relate to the following Registration Statements on Form "
+    "S-3 ... common stock, preferred stock, warrants, units and debt "
+    "securities. In accordance with the undertakings made by the Registrant "
+    "in the Registration Statements to remove from registration, by means of "
+    "a post-effective amendment, any of the securities that remain unsold at "
+    "the termination of the offerings, the Registrant hereby terminates the "
+    "effectiveness of the Registration Statements and removes from "
+    "registration any and all of the securities registered but unsold."
+)
+check("a POSASR deregistering unsold shelf securities does not page",
+      triage_filing("POSASR", NAVI_DEREG, "Navient LLC")[0] == 0)
+check("…nor the same on POS AM",
+      triage_filing("POS AM", NAVI_DEREG)[0] == 0)
+# Every live registration statement carries the Item 512 undertaking "to
+# remove from registration … any of the securities … which remain unsold" —
+# that alone must not read as a deregistration.
+check("a live POS AM with only the Item 512 undertaking still pages",
+      triage_filing("POS AM", "Post-Effective Amendment No. 2 to Form S-3. "
+                    "We may offer preferred stock and debt securities. "
+                    "The undersigned registrant hereby undertakes: To remove "
+                    "from registration by means of a post-effective amendment "
+                    "any of the securities being registered which remain "
+                    "unsold at the termination of the offering.")[0] == 2)
+
 
 # ---------------------------------------------------------------------------
 # Document-maintenance supplements — Sep 2026: six JPMorgan 424B3s reached
