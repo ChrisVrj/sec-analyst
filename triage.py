@@ -85,6 +85,24 @@ CAPITAL_RAISE_FORMS = frozenset({
     "424B1", "424B2", "424B3", "424B4", "424B5", "424B7", "424B8",
 })
 
+# A post-effective amendment is also how a shelf is taken DOWN. After a merger
+# or reorganisation the registrant files one per old shelf to "remove from
+# registration" whatever went unsold — nothing is offered, and outstanding
+# securities are untouched. Navient LLC's six POSASRs on 2026-10-29
+# (0001193125-26-436981 and siblings) each paged as a new issue after its
+# holding-company reorganisation.
+#
+# Matched on the deregistration heading or the operative "hereby terminates /
+# removes" — never on "remove from registration" alone, because that phrase
+# is the standard Item 512 undertaking in Part II of EVERY registration
+# statement, live shelves included.
+POST_EFFECTIVE_FORMS = frozenset({"POS AM", "POSASR"})
+_DEREGISTRATION_RE = re.compile(
+    r"\bderegistration\s+of\s+(?:unsold\s+)?securities\b"
+    r"|\bhereby\s+(?:terminates?|removes?|deregisters?)\b",
+    re.IGNORECASE,
+)
+
 # Shelf housekeeping and Rule 482 advertising. Mostly annual updates and
 # marketing, so these reach a tier only when the text names an offering.
 SOFT_FORMS = frozenset({"486APOS", "486BPOS", "497", "497K", "497AD", "FWP"})
@@ -363,6 +381,12 @@ def triage_filing(form_type, filing_text="", entity_name=""):
             # The announcement already went out weeks ago; this sets a date.
             notes.append(f"{base_form}/A amendment — announcement already made")
             return TIER_NONE, "", notes
+        if base_form in POST_EFFECTIVE_FORMS:
+            dereg = _DEREGISTRATION_RE.search(text)
+            if dereg:
+                notes.append(f"{base_form} deregisters unsold securities "
+                             f"({dereg.group(0)!r}) — nothing offered")
+                return TIER_NONE, "", notes
         # An offering that says outright it will never trade is not urgent,
         # whatever form it arrived on.
         #
